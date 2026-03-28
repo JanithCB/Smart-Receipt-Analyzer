@@ -1,0 +1,33 @@
+GUEST
+CHECK
+¿Table 11
+F3Y2:
+u2 Check #: 186242
+..Pax(s): 3
+19-02-2018 14:19:38
+scashier: |
+CASHIER
+F60%
+Description
+Qty
+U price Total TAX
+r. Mineral Water
+1x
+2:50
+Chocolate Waffle-Half Moon
+1 x
+17.90
+Total (Excluding GST):
+Serv. Charge (10%):
+GST: Payable:
+"Total (Inclusive of GST):
+Round ing Adi
+2.50
+SR
+17:90
+SR
+:20.40
+2.04
+1.35
+23:79
+0.01

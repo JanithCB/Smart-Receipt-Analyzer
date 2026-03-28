@@ -1,0 +1,57 @@
+:3 1801 017
+SYARIKAT PERNIAGAAN GIN KEE
+4 (81109-A):
+NO 290, JALAN AIR PANAS,
+SETAPAK;
+53200, KUALA LUMPUR.
+TEL : 03-40210276
+GST ID:: 000750673920
+SIMPLIFIED TAX INVOICE
+CASH
+Dôc. No.
+Cashier..
+i Salesperson
+: CS00012465
+: USER
+iltem
+3015
+Qty
+1
+S/Price
+10.60
+EGIWIRE RM10
+Total Qty:
+Total Sales (Excluding GST) :
+Discount
+Total GST :
+Rounding
+Total Sales (Inclusive of. GST) :
+CASH :
+Change :
+Date: 29/12/2017
+Time: 15:32:00
+Ref: :
+Amount
+10.60
+10.60
+10.00
+0.00
+0.60
+0.00
+10.60
+10.60
+0.00
+Tax
+SR
+GST-SUMMARY
+Tax Code
+ISR
+6
+Totäl: . .
+Amt (RM)
+10:00
+10,00
+Iax (RM)
+:0:60
+• 0:60
+GOODS SOLD ARE NOT. RETURNABLE, THANK YOU.
