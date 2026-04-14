@@ -1,9 +1,9 @@
-category,total_spent,avg_receipt,receipt_count
-Retail,428.9064,15.3181,28
-Other,335.2536,27.9378,12
-Food & Beverage,272.6976,11.3624,24
-Hardware & Tools,230.4168,20.947,11
-Grocery,86.9064,14.4844,6
-Transport,75.048,75.048,1
-Healthcare,27.096,9.032,3
-Fuel,7.2,7.2,1
+category,total_spent,avg_receipt,median_receipt,receipt_count,std_dev
+Retail,407.945,14.569,10.374,28,13.418
+Other,371.148,30.929,9.463,12,57.333
+Food & Beverage,317.18,12.687,5.736,25,16.277
+Hardware & Tools,230.417,20.947,4.704,11,31.463
+Grocery,86.88,14.48,15.98,6,9.007
+Transport,75.048,75.048,75.048,1,
+Healthcare,27.096,9.032,8.352,3,1.814
+Fuel,7.2,7.2,7.2,1,
