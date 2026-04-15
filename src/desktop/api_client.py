@@ -1,230 +1,316 @@
 # src/desktop/api_client.py
+
+import logging
 import os
+from pathlib import Path
+from typing import Any
+
 import requests
-from typing import Optional
+from requests import Response, Session
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+DEFAULT_TIMEOUT = int(os.getenv("API_TIMEOUT_SECONDS", "30"))
+UPLOAD_TIMEOUT = int(os.getenv("API_UPLOAD_TIMEOUT_SECONDS", "120"))
 
 
-BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
-TIMEOUT_DEFAULT = 120
-TIMEOUT_UPLOAD  = 600
-TIMEOUT_AI      = 300
+class APIError(Exception):
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+    def __str__(self) -> str:
+        if self.status_code:
+            return f"[{self.status_code}] {super().__str__()}"
+        return super().__str__()
 
 
 class APIClient:
-    def __init__(self, base_url: str = BASE_URL):
-        self.base_url = base_url.rstrip("/")
-        self.session  = requests.Session()
-        self.token: Optional[str] = None
+    def __init__(self) -> None:
+        self._base_url = os.getenv("API_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+        self._session = Session()
+        self._session.headers.update({"Accept": "application/json"})
 
-    def set_token(self, token: Optional[str]):
-        self.token = token
-        self.session.headers.pop("Authorization", None)
-        if token:
-            self.session.headers["Authorization"] = f"Bearer {token}"
+    # ──────────────────────────────────────────────────────────
+    # Token management
+    # ──────────────────────────────────────────────────────────
 
-    def logout(self):
-        self.set_token(None)
+    def set_token(self, token: str) -> None:
+        self._session.headers["Authorization"] = f"Bearer {token}"
 
-    def _handle(self, response: requests.Response):
-        if response.ok:
-            return response.json()
+    def clear_token(self) -> None:
+        self._session.headers.pop("Authorization", None)
+
+    def has_token(self) -> bool:
+        return "Authorization" in self._session.headers
+
+    # ──────────────────────────────────────────────────────────
+    # Internal helpers
+    # ──────────────────────────────────────────────────────────
+
+    def _url(self, path: str) -> str:
+        return f"{self._base_url}/{path.lstrip('/')}"
+
+    def _parse_response(self, response: Response) -> Any:
         try:
-            detail = response.json().get("detail", response.text)
+            payload = response.json()
         except Exception:
-            detail = response.text
-        raise RuntimeError(detail)
+            payload = None
 
-    # -- Auth ------------------------------------------------------------------
+        if response.ok:
+            return payload
 
-    # Fix #6: was missing username and full_name fields
-    def register(self, email: str, username: str, password: str, full_name: str = ""):
-        r = self.session.post(
-            f"{self.base_url}/auth/register",
-            json={
-                "email":     email,
-                "username":  username,   # was missing
-                "password":  password,
-                "full_name": full_name,  # was missing
-            },
-            timeout=TIMEOUT_DEFAULT,
+        detail = None
+        if isinstance(payload, dict):
+            detail = payload.get("detail") or payload.get("message")
+
+        if not detail:
+            detail = response.text[:300] if response.text else response.reason
+
+        raise APIError(
+            message=detail or "An unexpected error occurred.",
+            status_code=response.status_code,
         )
-        data = self._handle(r)
-        self.set_token(data["access_token"])
-        return data
 
-    def login(self, email: str, password: str):
-        r = self.session.post(
-            f"{self.base_url}/auth/login",
-            json={"email": email, "password": password},
-            timeout=TIMEOUT_DEFAULT,
-        )
-        data = self._handle(r)
-        self.set_token(data["access_token"])
-        return data
+    def _get(self, path: str, params: dict | None = None, timeout: int = DEFAULT_TIMEOUT) -> Any:
+        try:
+            response = self._session.get(self._url(path), params=params, timeout=timeout)
+        except requests.exceptions.ConnectionError:
+            raise APIError("Cannot connect to the backend. Make sure the server is running.")
+        except requests.exceptions.Timeout:
+            raise APIError("Request timed out. The server took too long to respond.")
+        except requests.exceptions.RequestException as exc:
+            raise APIError(f"Request failed: {exc}")
+        return self._parse_response(response)
 
-    def me(self):
-        r = self.session.get(
-            f"{self.base_url}/auth/me",
-            timeout=TIMEOUT_DEFAULT,
-        )
-        return self._handle(r)
+    def _post(
+        self,
+        path: str,
+        json: Any = None,
+        data: Any = None,
+        files: Any = None,
+        timeout: int = DEFAULT_TIMEOUT,
+    ) -> Any:
+        try:
+            response = self._session.post(
+                self._url(path),
+                json=json,
+                data=data,
+                files=files,
+                timeout=timeout,
+            )
+        except requests.exceptions.ConnectionError:
+            raise APIError("Cannot connect to the backend. Make sure the server is running.")
+        except requests.exceptions.Timeout:
+            raise APIError("Request timed out. The server took too long to respond.")
+        except requests.exceptions.RequestException as exc:
+            raise APIError(f"Request failed: {exc}")
+        return self._parse_response(response)
 
-    # -- Analytics -------------------------------------------------------------
+    def _put(self, path: str, json: Any = None, timeout: int = DEFAULT_TIMEOUT) -> Any:
+        try:
+            response = self._session.put(self._url(path), json=json, timeout=timeout)
+        except requests.exceptions.ConnectionError:
+            raise APIError("Cannot connect to the backend. Make sure the server is running.")
+        except requests.exceptions.Timeout:
+            raise APIError("Request timed out. The server took too long to respond.")
+        except requests.exceptions.RequestException as exc:
+            raise APIError(f"Request failed: {exc}")
+        return self._parse_response(response)
 
-    def get_summary(self, period: str = "month", year=None, month=None):
-        params = {"period": period}
-        if year  is not None: params["year"]  = year
-        if month is not None: params["month"] = month
-        r = self.session.get(
-            f"{self.base_url}/analytics/summary",
-            params=params,
-            timeout=TIMEOUT_DEFAULT,
-        )
-        return self._handle(r)
+    def _delete(self, path: str, timeout: int = DEFAULT_TIMEOUT) -> Any:
+        try:
+            response = self._session.delete(self._url(path), timeout=timeout)
+        except requests.exceptions.ConnectionError:
+            raise APIError("Cannot connect to the backend. Make sure the server is running.")
+        except requests.exceptions.Timeout:
+            raise APIError("Request timed out. The server took too long to respond.")
+        except requests.exceptions.RequestException as exc:
+            raise APIError(f"Request failed: {exc}")
+        return self._parse_response(response)
 
-    def get_analytics(self, period: str = "month"):
-        r = self.session.get(
-            f"{self.base_url}/analytics",
-            params={"period": period},
-            timeout=TIMEOUT_DEFAULT,
-        )
-        return self._handle(r)
+    # ──────────────────────────────────────────────────────────
+    # Health
+    # ──────────────────────────────────────────────────────────
 
-    def get_recent(self, limit: int = 20):
-        r = self.session.get(
-            f"{self.base_url}/analytics/recent",
-            params={"limit": limit},
-            timeout=TIMEOUT_DEFAULT,
-        )
-        return self._handle(r)
+    def health_check(self) -> dict:
+        return self._get("/health", timeout=5)
 
-    # -- Receipts --------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────
+    # Auth
+    # ──────────────────────────────────────────────────────────
+
+    def register(
+        self,
+        email: str,
+        username: str,
+        password: str,
+        full_name: str | None = None,
+    ) -> dict:
+        payload: dict[str, Any] = {
+            "email": email,
+            "username": username,
+            "password": password,
+        }
+        if full_name:
+            payload["full_name"] = full_name
+
+        result = self._post("/auth/register", json=payload)
+        if isinstance(result, dict) and result.get("access_token"):
+            self.set_token(result["access_token"])
+        return result
+
+    def login(self, email: str, password: str) -> dict:
+        result = self._post("/auth/login", json={"email": email, "password": password})
+        if isinstance(result, dict) and result.get("access_token"):
+            self.set_token(result["access_token"])
+        return result
+
+    def get_me(self) -> dict:
+        return self._get("/auth/me")
+
+    def update_me(
+        self,
+        full_name: str | None = None,
+        email: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> dict:
+        payload: dict[str, Any] = {}
+        if full_name is not None:
+            payload["full_name"] = full_name
+        if email is not None:
+            payload["email"] = email
+        if username is not None:
+            payload["username"] = username
+        if password is not None:
+            payload["password"] = password
+        return self._put("/auth/me", json=payload)
+
+    # ──────────────────────────────────────────────────────────
+    # Receipts
+    # ──────────────────────────────────────────────────────────
+
+    def upload_receipt(self, file_path: str | Path) -> dict:
+        path = Path(file_path)
+        if not path.exists():
+            raise APIError(f"File not found: {path}")
+
+        mime_map = {
+            ".jpg":  "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png":  "image/png",
+            ".webp": "image/webp",
+            ".bmp":  "image/bmp",
+            ".tif":  "image/tiff",
+            ".tiff": "image/tiff",
+            ".pdf":  "application/pdf",
+        }
+        mime_type = mime_map.get(path.suffix.lower(), "application/octet-stream")
+
+        with path.open("rb") as fh:
+            files = {"file": (path.name, fh, mime_type)}
+            result = self._post("/receipts/upload", files=files, timeout=UPLOAD_TIMEOUT)
+
+        return result
 
     def list_receipts(
         self,
         page: int = 1,
         page_size: int = 20,
-        category: Optional[str] = None,
-        status: Optional[str] = None,
-        needs_review: Optional[bool] = None,
-        search: Optional[str] = None,
-    ):
-        params = {"page": page, "page_size": page_size}
-        if category     is not None: params["category"]     = category
-        if status       is not None: params["status"]       = status
-        if needs_review is not None: params["needs_review"] = needs_review
-        if search       is not None: params["search"]       = search
-        r = self.session.get(
-            f"{self.base_url}/receipts",
-            params=params,
-            timeout=TIMEOUT_DEFAULT,
-        )
-        return self._handle(r)
+        category: str | None = None,
+        status: str | None = None,
+        search: str | None = None,
+        needs_review: bool | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {"page": page, "page_size": page_size}
+        if category:
+            params["category"] = category
+        if status:
+            params["status"] = status
+        if search:
+            params["search"] = search
+        if needs_review is not None:
+            params["needs_review"] = needs_review
+        return self._get("/receipts", params=params)
 
-    def get_receipt(self, receipt_id: int):
-        r = self.session.get(
-            f"{self.base_url}/receipts/{receipt_id}",
-            timeout=TIMEOUT_DEFAULT,
-        )
-        return self._handle(r)
+    def get_receipt(self, receipt_id: int) -> dict:
+        return self._get(f"/receipts/{receipt_id}")
 
-    def update_receipt(self, receipt_id: int, **kwargs):
-        r = self.session.put(
-            f"{self.base_url}/receipts/{receipt_id}",
-            json=kwargs,
-            timeout=TIMEOUT_DEFAULT,
-        )
-        return self._handle(r)
+    def update_receipt(
+        self,
+        receipt_id: int,
+        merchant: str | None = None,
+        total_amount: float | None = None,
+        currency: str | None = None,
+        category: str | None = None,
+        subcategory: str | None = None,
+        notes: str | None = None,
+        receipt_date: str | None = None,
+    ) -> dict:
+        payload: dict[str, Any] = {}
+        if merchant is not None:
+            payload["merchant"] = merchant
+        if total_amount is not None:
+            payload["total_amount"] = total_amount
+        if currency is not None:
+            payload["currency"] = currency
+        if category is not None:
+            payload["category"] = category
+        if subcategory is not None:
+            payload["subcategory"] = subcategory
+        if notes is not None:
+            payload["notes"] = notes
+        if receipt_date is not None:
+            payload["receipt_date"] = receipt_date
+        return self._put(f"/receipts/{receipt_id}", json=payload)
 
-    def delete_receipt(self, receipt_id: int):
-        r = self.session.delete(
-            f"{self.base_url}/receipts/{receipt_id}",
-            timeout=TIMEOUT_DEFAULT,
-        )
-        if r.status_code == 204:
-            return {}
-        return self._handle(r)
+    def delete_receipt(self, receipt_id: int) -> dict | None:
+        return self._delete(f"/receipts/{receipt_id}")
 
-    def reprocess_receipt(self, receipt_id: int):
-        r = self.session.post(
-            f"{self.base_url}/receipts/{receipt_id}/reprocess",
-            timeout=TIMEOUT_DEFAULT,
-        )
-        return self._handle(r)
+    def reprocess_receipt(self, receipt_id: int) -> dict:
+        return self._post(f"/receipts/{receipt_id}/reprocess")
 
     def correct_category(
         self,
         receipt_id: int,
-        corrected_category: str,
-        corrected_subcategory: Optional[str] = None,
-    ):
-        r = self.session.post(
-            f"{self.base_url}/receipts/correct-category",
-            json={
-                "receipt_id":            receipt_id,
-                "corrected_category":    corrected_category,
-                "corrected_subcategory": corrected_subcategory,
-            },
-            timeout=TIMEOUT_DEFAULT,
+        category: str,
+        subcategory: str | None = None,
+    ) -> dict:
+        payload: dict[str, Any] = {"category": category}
+        if subcategory is not None:
+            payload["subcategory"] = subcategory
+        return self._post(f"/receipts/{receipt_id}/correct-category", json=payload)
+
+    # ──────────────────────────────────────────────────────────
+    # Analytics
+    # ──────────────────────────────────────────────────────────
+
+    def get_analytics(self, period: str = "month") -> dict:
+        return self._get("/analytics", params={"period": period})
+
+    def get_summary(self, period: str = "month") -> dict:
+        return self._get("/analytics/summary", params={"period": period})
+
+    def get_recent(self, limit: int = 10) -> list:
+        return self._get("/analytics/recent", params={"limit": limit})
+
+    # ──────────────────────────────────────────────────────────
+    # Advisor
+    # ──────────────────────────────────────────────────────────
+
+    def get_insights(self, period: str = "month") -> list:
+        return self._get("/advisor/insights", params={"period": period})
+
+    def get_auto_insights(self, period: str = "month") -> list:
+        return self._get("/advisor/insights/auto", params={"period": period})
+
+    def ask_advisor(self, question: str, period: str = "month") -> dict:
+        return self._post(
+            "/advisor/ask",
+            json={"question": question, "period": period},
         )
-        return self._handle(r)
-
-    def upload_receipt(self, path: str):
-        with open(path, "rb") as f:
-            r = self.session.post(
-                f"{self.base_url}/receipts/upload",
-                files={"file": (os.path.basename(path), f, "application/octet-stream")},
-                timeout=TIMEOUT_UPLOAD,
-            )
-        return self._handle(r)
-
-    def upload_receipts(self, paths: list):
-        results = []
-        errors  = []
-        for path in paths:
-            try:
-                result = self.upload_receipt(path)
-                results.append(result)
-            except Exception as e:
-                errors.append({"file": path, "error": str(e)})
-        return {"results": results, "errors": errors}
-
-    # -- AI Advisor ------------------------------------------------------------
-
-    def get_insights(self):
-        r = self.session.get(
-            f"{self.base_url}/advisor/insights",
-            timeout=TIMEOUT_AI,
-        )
-        return self._handle(r)
-
-    def get_auto_insights(self):
-        r = self.session.get(
-            f"{self.base_url}/advisor/insights/auto",
-            timeout=TIMEOUT_AI,
-        )
-        return self._handle(r)
-
-    def ask_advisor(self, question: str):
-        r = self.session.post(
-            f"{self.base_url}/advisor/ask",
-            json={"question": question},
-            timeout=TIMEOUT_AI,
-        )
-        return self._handle(r)
-
-    # -- Health ----------------------------------------------------------------
-
-    def health_check(self):
-        try:
-            r = self.session.get(
-                f"{self.base_url}/health",
-                timeout=5,
-            )
-            return r.ok
-        except Exception:
-            return False
 
 
-# Single shared instance used by all desktop views
 api = APIClient()

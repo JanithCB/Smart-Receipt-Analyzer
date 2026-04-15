@@ -1,204 +1,226 @@
-from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, List, Any
+# src/backend/schemas.py
+
 from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
-# ─── Auth / User ────────────────────────────────────────────────────────────
-
-class UserCreate(BaseModel):
+class UserBase(BaseModel):
     email: EmailStr
-    username: str = Field(..., min_length=3, max_length=50)
-    password: str = Field(..., min_length=6)
-    full_name: Optional[str] = None
+    username: str = Field(min_length=3, max_length=100)
+    full_name: str | None = Field(default=None, max_length=255)
+
+
+class UserCreate(UserBase):
+    password: str = Field(min_length=6, max_length=128)
 
 
 class UserLogin(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(min_length=1, max_length=128)
+
+
+class UserUpdate(BaseModel):
+    email: EmailStr | None = None
+    username: str | None = Field(default=None, min_length=3, max_length=100)
+    full_name: str | None = Field(default=None, max_length=255)
+    password: str | None = Field(default=None, min_length=6, max_length=128)
 
 
 class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
-    email: str
+    email: EmailStr
     username: str
-    full_name: Optional[str]
+    full_name: str | None = None
     is_active: bool
-    is_verified: bool
+    is_superuser: bool
     created_at: datetime
-
-    class Config:
-        from_attributes = True
+    updated_at: datetime
 
 
-class Token(BaseModel):
+class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserOut
 
 
-class TokenData(BaseModel):
-    user_id: Optional[int] = None
+class LineItemBase(BaseModel):
+    item_name: str = Field(min_length=1, max_length=255)
+    quantity: float | None = None
+    unit_price: float | None = None
+    total_price: float | None = None
+    category: str | None = Field(default=None, max_length=100)
+    notes: str | None = None
 
 
-# ─── Line Items ──────────────────────────────────────────────────────────────
+class LineItemOut(LineItemBase):
+    model_config = ConfigDict(from_attributes=True)
 
-class LineItemOut(BaseModel):
     id: int
-    description: Optional[str]
-    description_translated: Optional[str]
-    quantity: Optional[float]
-    unit_price: Optional[float]
-    total_price: Optional[float]
-    category: Optional[str]
-
-    class Config:
-        from_attributes = True
-
-
-# ─── Receipt ─────────────────────────────────────────────────────────────────
-
-class ReceiptUpdate(BaseModel):
-    merchant: Optional[str] = None
-    total_amount: Optional[float] = None
-    currency: Optional[str] = None
-    receipt_date: Optional[datetime] = None
-    category: Optional[str] = None
-    subcategory: Optional[str] = None
-    payment_method: Optional[str] = None
-    notes: Optional[str] = None
-    user_verified: Optional[bool] = None
-
-
-class ReceiptOut(BaseModel):
-    id: int
-    filename: str
-    merchant: Optional[str]
-    merchant_normalized: Optional[str]
-    total_amount: Optional[float]
-    currency: Optional[str]
-    receipt_date: Optional[datetime]
-    tax_amount: Optional[float]
-    tip_amount: Optional[float]
-    payment_method: Optional[str]
-    category: Optional[str]
-    subcategory: Optional[str]
-    category_confidence: Optional[float]
-    category_source: Optional[str]
-    needs_review: bool
-    processing_status: str
-    processing_error: Optional[str]
-    detected_language: Optional[str]
-    user_verified: bool
-    notes: Optional[str]
-    line_items_detail: List[LineItemOut] = []
+    receipt_id: int
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+
+class ReceiptCreate(BaseModel):
+    original_filename: str | None = Field(default=None, max_length=255)
+    notes: str | None = None
 
 
-class ReceiptListOut(BaseModel):
-    total: int
-    page: int
-    page_size: int
-    items: List[ReceiptOut]
+class ReceiptUpdate(BaseModel):
+    merchant: str | None = Field(default=None, max_length=255)
+    total_amount: float | None = None
+    currency: str | None = Field(default=None, max_length=16)
+    receipt_date: datetime | None = None
+    category: str | None = Field(default=None, max_length=100)
+    subcategory: str | None = Field(default=None, max_length=100)
+    notes: str | None = None
+    needs_review: bool | None = None
+    language: str | None = Field(default=None, max_length=32)
 
 
-# ─── Analytics ───────────────────────────────────────────────────────────────
+class ReceiptOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
 
-class CategorySpend(BaseModel):
+    id: int
+    user_id: int
+    original_filename: str
+    file_path: str
+    mime_type: str | None = None
+    ocr_text: str | None = None
+    translated_text: str | None = None
+    merchant: str | None = None
+    total_amount: float | None = None
+    currency: str | None = None
+    receipt_date: datetime | None = None
+    category: str | None = None
+    subcategory: str | None = None
+    notes: str | None = None
+    processing_status: str
+    confidence: float | None = None
+    category_source: str | None = None
+    needs_review: bool
+    language: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    line_items: list[LineItemOut] = []
+
+
+class PaginationMeta(BaseModel):
+    page: int = Field(ge=1)
+    page_size: int = Field(ge=1)
+    total_items: int = Field(ge=0)
+    total_pages: int = Field(ge=0)
+
+
+class ReceiptListResponse(BaseModel):
+    items: list[ReceiptOut]
+    pagination: PaginationMeta
+
+
+class BudgetBase(BaseModel):
+    category: str = Field(min_length=1, max_length=100)
+    amount_limit: float = Field(gt=0)
+    period: str = Field(default="monthly", min_length=1, max_length=20)
+    is_active: bool = True
+
+
+class BudgetCreate(BudgetBase):
+    pass
+
+
+class BudgetUpdate(BaseModel):
+    category: str | None = Field(default=None, min_length=1, max_length=100)
+    amount_limit: float | None = Field(default=None, gt=0)
+    period: str | None = Field(default=None, min_length=1, max_length=20)
+    is_active: bool | None = None
+
+
+class BudgetOut(BudgetBase):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class CategoryCorrectionRequest(BaseModel):
+    corrected_category: str = Field(min_length=1, max_length=100)
+    corrected_subcategory: str | None = Field(default=None, max_length=100)
+
+
+class CategoryBreakdownItem(BaseModel):
     category: str
-    total: float
+    amount: float
     count: int
     percentage: float
 
 
-class MonthlyTrend(BaseModel):
-    month: str
-    total: float
-    count: int
-
-
-class MerchantSummary(BaseModel):
-    merchant: str
-    total: float
-    count: int
-    last_visit: Optional[datetime]
-
-
-class AnalyticsSummary(BaseModel):
-    total_spend: float
-    total_receipts: int
-    avg_per_receipt: float
-    top_category: Optional[str]
-    top_merchant: Optional[str]
-    uncategorized_count: int
-    needs_review_count: int
-    currency: str
-
-
-class AnalyticsResponse(BaseModel):
-    summary: AnalyticsSummary
-    category_breakdown: List[CategorySpend]
-    monthly_trends: List[MonthlyTrend]
-    top_merchants: List[MerchantSummary]
-
-
-# ─── AI Insights ─────────────────────────────────────────────────────────────
-
-class InsightItem(BaseModel):
-    type: str          # 'alert', 'tip', 'trend', 'anomaly'
-    title: str
-    description: str
-    value: Optional[Any] = None
-    category: Optional[str] = None
-
-
-class InsightsResponse(BaseModel):
-    insights: List[InsightItem]
-    generated_at: datetime
-
-
-# ─── Ask AI ──────────────────────────────────────────────────────────────────
-
-class AskQuestion(BaseModel):
-    question: str = Field(..., min_length=3, max_length=500)
-
-
-class AskResponse(BaseModel):
-    question: str
-    answer: str
-    related_receipts: Optional[List[int]] = None
-    generated_at: datetime
-
-
-# ─── Budget ──────────────────────────────────────────────────────────────────
-
-class BudgetCreate(BaseModel):
-    category: str
-    amount: float = Field(..., gt=0)
-    period: str = "monthly"
-    start_date: Optional[datetime] = None
-    end_date: Optional[datetime] = None
-
-
-class BudgetOut(BaseModel):
-    id: int
-    category: str
-    amount: float
+class MonthlyTrendItem(BaseModel):
     period: str
-    start_date: Optional[datetime]
-    end_date: Optional[datetime]
+    amount: float
+    count: int
+
+
+class RecentReceiptItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    merchant: str | None = None
+    total_amount: float | None = None
+    currency: str | None = None
+    category: str | None = None
+    receipt_date: datetime | None = None
+    processing_status: str
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+
+class TopMerchantItem(BaseModel):
+    merchant: str
+    amount: float
+    count: int
 
 
-# ─── Category Correction ─────────────────────────────────────────────────────
+class AnomalyItem(BaseModel):
+    type: str
+    message: str
+    category: str | None = None
+    amount: float | None = None
+    period: str | None = None
+    metadata: dict[str, Any] | None = None
 
-class CategoryCorrection(BaseModel):
-    receipt_id: int
-    corrected_category: str
-    corrected_subcategory: Optional[str] = None
+
+class AnalyticsSummaryResponse(BaseModel):
+    total_spend: float
+    receipt_count: int
+    average_spend: float
+    top_category: str | None = None
+    category_breakdown: list[CategoryBreakdownItem] = []
+    monthly_trend: list[MonthlyTrendItem] = []
+    top_merchants: list[TopMerchantItem] = []
+    anomalies: list[AnomalyItem] = []
+
+
+class InsightItem(BaseModel):
+    id: str
+    type: str
+    title: str
+    message: str
+    severity: str = "info"
+    category: str | None = None
+    amount: float | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class AskAdvisorRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=1000)
+
+
+class AskAdvisorResponse(BaseModel):
+    answer: str
+    sources: list[str] = []
+    insights: list[InsightItem] = []

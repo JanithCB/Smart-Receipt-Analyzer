@@ -1,45 +1,62 @@
-# src/backend/security.py
-from datetime import datetime, timedelta
-from typing import Optional
 import os
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
 import bcrypt
-from jose import JWTError, jwt
+from jose import JWTError, ExpiredSignatureError, jwt
 
 
-SECRET_KEY = os.getenv("SECRET_KEY", "your-super-secret-key-change-in-production-please")
-ALGORITHM  = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))  # 24 hrs
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_HOURS = int(os.getenv("ACCESS_TOKEN_EXPIRE_HOURS", "24"))
 
 
-# Fix 1: dropped passlib entirely — bcrypt directly avoids the
-#         passlib 1.7.4 + bcrypt 4.x + Python 3.13 incompatibility
+class TokenError(Exception):
+    pass
 
 
 def hash_password(password: str) -> str:
-    # Fix 2: encode to bytes, enforce 72-byte limit bcrypt requires
-    secret = password.encode("utf-8")[:72]
-    return bcrypt.hashpw(secret, bcrypt.gensalt()).decode("utf-8")
+    password_bytes = password.encode("utf-8")
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password_bytes, salt)
+    return hashed.decode("utf-8")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    secret = plain_password.encode("utf-8")[:72]
     try:
-        return bcrypt.checkpw(secret, hashed_password.encode("utf-8"))
-    except Exception:
+        return bcrypt.checkpw(
+            plain_password.encode("utf-8"),
+            hashed_password.encode("utf-8"),
+        )
+    except ValueError:
         return False
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    to_encode = data.copy()
-    expire    = datetime.utcnow() + (
-        expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+def create_access_token(subject: str | int, expires_delta: timedelta | None = None) -> str:
+    expire = datetime.now(timezone.utc) + (
+        expires_delta or timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
     )
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+    payload = {
+        "sub": str(subject),
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+    }
+
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
-def decode_token(token: str) -> Optional[dict]:
+def decode_access_token(token: str) -> dict[str, Any]:
     try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except JWTError:
-        return None
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+
+        subject = payload.get("sub")
+        if not subject:
+            raise TokenError("Token is missing subject")
+
+        return payload
+
+    except ExpiredSignatureError as exc:
+        raise TokenError("Token has expired") from exc
+    except JWTError as exc:
+        raise TokenError("Invalid token") from exc

@@ -1,242 +1,281 @@
 # src/desktop/workers.py
-from PySide6.QtCore import QObject, QRunnable, Signal, Slot, QThread
-from desktop.api_client import api
+
+import logging
+from pathlib import Path
+from typing import Any, Callable
+
+from PySide6.QtCore import QObject, QRunnable, Qt, QThread, Signal, Slot
+
+from desktop.api_client import APIError, api
+
+logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Base signal carrier
+# QRunnable cannot inherit QObject directly, so signals live in a
+# separate QObject that the runnable holds a hard reference to.
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 class WorkerSignals(QObject):
-    finished = Signal(object)
+    finished = Signal()
     error    = Signal(str)
+    result   = Signal(object)
+    progress = Signal(int)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Generic API worker
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 class ApiWorker(QRunnable):
-    """Generic worker — wraps any callable and runs it off the GUI thread."""
-    def __init__(self, fn, *args, **kwargs):
+    """
+    Run any callable off the UI thread.
+    The callable is called with no arguments; use functools.partial or a
+    lambda to capture arguments before passing the worker to the thread pool.
+
+    Example:
+        worker = ApiWorker(lambda: api.list_receipts(page=1))
+        worker.signals.result.connect(my_slot)
+        worker.signals.error.connect(error_slot)
+        QThreadPool.globalInstance().start(worker)
+    """
+
+    def __init__(self, fn: Callable[[], Any]) -> None:
         super().__init__()
-        self.fn      = fn
-        self.args    = args
-        self.kwargs  = kwargs
+        self._fn = fn
         self.signals = WorkerSignals()
+        self.setAutoDelete(True)
 
     @Slot()
-    def run(self):
+    def run(self) -> None:
         try:
-            result = self.fn(*self.args, **self.kwargs)
-            self.signals.finished.emit(result)
-        except Exception as e:
-            self.signals.error.emit(str(e))
+            result = self._fn()
+            self.signals.result.emit(result)
+        except APIError as exc:
+            logger.warning("ApiWorker APIError: %s", exc)
+            self.signals.error.emit(str(exc))
+        except Exception as exc:
+            logger.exception("ApiWorker unexpected error: %s", exc)
+            self.signals.error.emit(f"Unexpected error: {exc}")
+        finally:
+            self.signals.finished.emit()
 
 
-# ── Receipt list / detail / update / delete / reprocess ──────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Upload worker — one file at a time, emits progress per file
+# ──────────────────────────────────────────────────────────────────────────────
 
-class ListReceiptsWorker(QRunnable):
-    def __init__(self, page=1, page_size=20, category=None,
-                 status=None, needs_review=None, search=None):
+
+class UploadWorkerSignals(QObject):
+    finished      = Signal()
+    error         = Signal(str, str)   # (filename, error_message)
+    file_done     = Signal(str, object)  # (filename, receipt_dict)
+    progress      = Signal(int, int)   # (completed_count, total_count)
+
+
+class UploadWorker(QRunnable):
+    """
+    Upload a list of file paths sequentially, one at a time.
+    Emits per-file signals so the UI can update a progress list.
+
+    Example:
+        worker = UploadWorker(["/path/a.jpg", "/path/b.png"])
+        worker.signals.file_done.connect(on_file_done)
+        worker.signals.progress.connect(on_progress)
+        worker.signals.finished.connect(on_all_done)
+        QThreadPool.globalInstance().start(worker)
+    """
+
+    def __init__(self, file_paths: list[str | Path]) -> None:
         super().__init__()
-        self.kwargs  = dict(page=page, page_size=page_size,
-                            category=category, status=status,
-                            needs_review=needs_review, search=search)
-        self.signals = WorkerSignals()
+        self._file_paths = [Path(p) for p in file_paths]
+        self.signals = UploadWorkerSignals()
+        self.setAutoDelete(True)
 
     @Slot()
-    def run(self):
-        try:
-            self.signals.finished.emit(api.list_receipts(**self.kwargs))
-        except Exception as e:
-            self.signals.error.emit(str(e))
+    def run(self) -> None:
+        total = len(self._file_paths)
+        completed = 0
 
-
-class GetReceiptWorker(QRunnable):
-    def __init__(self, receipt_id: int):
-        super().__init__()
-        self.receipt_id = receipt_id
-        self.signals    = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            self.signals.finished.emit(api.get_receipt(self.receipt_id))
-        except Exception as e:
-            self.signals.error.emit(str(e))
-
-
-class UpdateReceiptWorker(QRunnable):
-    def __init__(self, receipt_id: int, **kwargs):
-        super().__init__()
-        self.receipt_id = receipt_id
-        self.kwargs     = kwargs
-        self.signals    = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            self.signals.finished.emit(
-                api.update_receipt(self.receipt_id, **self.kwargs)
-            )
-        except Exception as e:
-            self.signals.error.emit(str(e))
-
-
-class DeleteReceiptWorker(QRunnable):
-    def __init__(self, receipt_id: int):
-        super().__init__()
-        self.receipt_id = receipt_id
-        self.signals    = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            self.signals.finished.emit(api.delete_receipt(self.receipt_id))
-        except Exception as e:
-            self.signals.error.emit(str(e))
-
-
-class ReprocessReceiptWorker(QRunnable):
-    def __init__(self, receipt_id: int):
-        super().__init__()
-        self.receipt_id = receipt_id
-        self.signals    = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            self.signals.finished.emit(api.reprocess_receipt(self.receipt_id))
-        except Exception as e:
-            self.signals.error.emit(str(e))
-
-
-class CorrectCategoryWorker(QRunnable):
-    def __init__(self, receipt_id: int, category: str, subcategory: str = None):
-        super().__init__()
-        self.receipt_id  = receipt_id
-        self.category    = category
-        self.subcategory = subcategory
-        self.signals     = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            self.signals.finished.emit(
-                api.correct_category(self.receipt_id, self.category, self.subcategory)
-            )
-        except Exception as e:
-            self.signals.error.emit(str(e))
-
-
-# ── Upload ────────────────────────────────────────────────────────────────────
-
-class UploadReceiptWorker(QRunnable):
-    """Uploads a list of file paths one by one."""
-
-    class Signals(QObject):
-        file_done  = Signal(str, object)  # (path, result)
-        file_error = Signal(str, str)     # (path, error)
-        finished   = Signal(object)       # final summary dict
-        error      = Signal(str)
-
-    def __init__(self, paths: list):
-        super().__init__()
-        self.paths   = paths
-        self.signals = UploadReceiptWorker.Signals()
-
-    @Slot()
-    def run(self):
-        results = []
-        errors  = []
-        for path in self.paths:
+        for file_path in self._file_paths:
             try:
-                result = api.upload_receipt(path)
-                results.append(result)
-                self.signals.file_done.emit(path, result)
-            except Exception as e:
-                errors.append({"file": path, "error": str(e)})
-                self.signals.file_error.emit(path, str(e))
-        self.signals.finished.emit({"results": results, "errors": errors})
+                receipt = api.upload_receipt(file_path)
+                completed += 1
+                self.signals.file_done.emit(file_path.name, receipt)
+                self.signals.progress.emit(completed, total)
+            except APIError as exc:
+                logger.warning("Upload failed for %s: %s", file_path.name, exc)
+                self.signals.error.emit(file_path.name, str(exc))
+                completed += 1
+                self.signals.progress.emit(completed, total)
+            except Exception as exc:
+                logger.exception("Unexpected upload error for %s: %s", file_path.name, exc)
+                self.signals.error.emit(file_path.name, f"Unexpected error: {exc}")
+                completed += 1
+                self.signals.progress.emit(completed, total)
+
+        self.signals.finished.emit()
 
 
-# ── Analytics ─────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Health check worker — QThread based so it can be reused with a timer
+# ──────────────────────────────────────────────────────────────────────────────
 
-class GetSummaryWorker(QRunnable):
-    def __init__(self, period="month", year=None, month=None):
-        super().__init__()
-        self.period  = period
-        self.year    = year
-        self.month   = month
-        self.signals = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            self.signals.finished.emit(
-                api.get_summary(self.period, self.year, self.month)
-            )
-        except Exception as e:
-            self.signals.error.emit(str(e))
-
-
-class GetRecentWorker(QRunnable):
-    def __init__(self, limit=20):
-        super().__init__()
-        self.limit   = limit
-        self.signals = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            self.signals.finished.emit(api.get_recent(self.limit))
-        except Exception as e:
-            self.signals.error.emit(str(e))
-
-
-# ── AI Advisor ────────────────────────────────────────────────────────────────
-
-class GetInsightsWorker(QRunnable):
-    def __init__(self):
-        super().__init__()
-        self.signals = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            self.signals.finished.emit(api.get_insights())
-        except Exception as e:
-            self.signals.error.emit(str(e))
-
-
-class GetAutoInsightsWorker(QRunnable):
-    def __init__(self):
-        super().__init__()
-        self.signals = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            self.signals.finished.emit(api.get_auto_insights())
-        except Exception as e:
-            self.signals.error.emit(str(e))
-
-
-class AskAdvisorWorker(QRunnable):
-    def __init__(self, question: str):
-        super().__init__()
-        self.question = question
-        self.signals  = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            self.signals.finished.emit(api.ask_advisor(self.question))
-        except Exception as e:
-            self.signals.error.emit(str(e))
-
-
-# ── Health check ──────────────────────────────────────────────────────────────
 
 class HealthCheckWorker(QThread):
-    finished = Signal(dict)
+    """
+    Poll the backend /health endpoint once.
+    Use QThread so the caller can hold a persistent reference and
+    re-trigger checks without recreating the object.
 
-    def run(self):
+    Example:
+        self._health = HealthCheckWorker()
+        self._health.healthy.connect(on_healthy)
+        self._health.unreachable.connect(on_unreachable)
+        self._health.start()
+    """
+
+    healthy     = Signal(dict)
+    unreachable = Signal(str)
+
+    def run(self) -> None:
         try:
-            ok = api.health_check()
-            self.finished.emit({"healthy": ok})
-        except Exception:
-            self.finished.emit({"healthy": False})
+            result = api.health_check()
+            self.healthy.emit(result if isinstance(result, dict) else {})
+        except APIError as exc:
+            self.unreachable.emit(str(exc))
+        except Exception as exc:
+            self.unreachable.emit(f"Health check failed: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Convenience factory functions
+# Each returns a configured ApiWorker ready to pass to QThreadPool.
+# Caller must connect signals before submitting to the pool.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def make_login_worker(email: str, password: str) -> ApiWorker:
+    return ApiWorker(lambda: api.login(email, password))
+
+
+def make_register_worker(
+    email: str,
+    username: str,
+    password: str,
+    full_name: str | None = None,
+) -> ApiWorker:
+    return ApiWorker(lambda: api.register(email, username, password, full_name))
+
+
+def make_get_me_worker() -> ApiWorker:
+    return ApiWorker(api.get_me)
+
+
+def make_update_me_worker(
+    full_name: str | None = None,
+    email: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+) -> ApiWorker:
+    return ApiWorker(
+        lambda: api.update_me(
+            full_name=full_name,
+            email=email,
+            username=username,
+            password=password,
+        )
+    )
+
+
+def make_list_receipts_worker(
+    page: int = 1,
+    page_size: int = 20,
+    category: str | None = None,
+    status: str | None = None,
+    search: str | None = None,
+    needs_review: bool | None = None,
+) -> ApiWorker:
+    return ApiWorker(
+        lambda: api.list_receipts(
+            page=page,
+            page_size=page_size,
+            category=category,
+            status=status,
+            search=search,
+            needs_review=needs_review,
+        )
+    )
+
+
+def make_get_receipt_worker(receipt_id: int) -> ApiWorker:
+    return ApiWorker(lambda: api.get_receipt(receipt_id))
+
+
+def make_update_receipt_worker(
+    receipt_id: int,
+    merchant: str | None = None,
+    total_amount: float | None = None,
+    currency: str | None = None,
+    category: str | None = None,
+    subcategory: str | None = None,
+    notes: str | None = None,
+    receipt_date: str | None = None,
+) -> ApiWorker:
+    return ApiWorker(
+        lambda: api.update_receipt(
+            receipt_id,
+            merchant=merchant,
+            total_amount=total_amount,
+            currency=currency,
+            category=category,
+            subcategory=subcategory,
+            notes=notes,
+            receipt_date=receipt_date,
+        )
+    )
+
+
+def make_delete_receipt_worker(receipt_id: int) -> ApiWorker:
+    return ApiWorker(lambda: api.delete_receipt(receipt_id))
+
+
+def make_reprocess_receipt_worker(receipt_id: int) -> ApiWorker:
+    return ApiWorker(lambda: api.reprocess_receipt(receipt_id))
+
+
+def make_correct_category_worker(
+    receipt_id: int,
+    category: str,
+    subcategory: str | None = None,
+) -> ApiWorker:
+    return ApiWorker(
+        lambda: api.correct_category(receipt_id, category, subcategory)
+    )
+
+
+def make_analytics_worker(period: str = "month") -> ApiWorker:
+    return ApiWorker(lambda: api.get_analytics(period))
+
+
+def make_summary_worker(period: str = "month") -> ApiWorker:
+    return ApiWorker(lambda: api.get_summary(period))
+
+
+def make_recent_receipts_worker(limit: int = 10) -> ApiWorker:
+    return ApiWorker(lambda: api.get_recent(limit))
+
+
+def make_insights_worker(period: str = "month") -> ApiWorker:
+    return ApiWorker(lambda: api.get_insights(period))
+
+
+def make_auto_insights_worker(period: str = "month") -> ApiWorker:
+    return ApiWorker(lambda: api.get_auto_insights(period))
+
+
+def make_ask_advisor_worker(question: str, period: str = "month") -> ApiWorker:
+    return ApiWorker(lambda: api.ask_advisor(question, period))

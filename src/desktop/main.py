@@ -1,382 +1,451 @@
 # src/desktop/main.py
-"""
-Desktop Application Entry Point
-Manages: Auth state, main window, tab navigation, stylesheet
-"""
+
+import logging
 import sys
-import os
+from pathlib import Path
 
-# Fix 1: PyQt6 → PySide6 throughout (was mixing both frameworks)
+src_dir = Path(__file__).resolve().parents[1]
+if str(src_dir) not in sys.path:
+    sys.path.insert(0, str(src_dir))
+
+from PySide6.QtCore import Qt, Slot
+from PySide6.QtGui import QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout,
-    QHBoxLayout, QLabel, QPushButton, QStackedWidget,
-    QFrame, QSizePolicy, QStatusBar
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QSizePolicy,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont, QIcon
 
-from .views.login_view import LoginView
-from .views.upload_view import UploadView
-from .views.receipts_view import ReceiptsView
-from .views.analytics_view import AnalyticsView
-from .views.insights_view import InsightsView
-from .views.ask_view import AskView
-from .workers import HealthCheckWorker
-from .api_client import api
+from desktop.api_client import api
+from desktop.views import (
+    AnalyticsView,
+    AskView,
+    InsightsView,
+    LoginView,
+    RegisterView,
+    ReceiptsView,
+    UploadView,
+)
 
+logger = logging.getLogger(__name__)
 
-APP_NAME    = "Receipt Analyzer"
-APP_VERSION = "2.0"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
 
-
-STYLESHEET = """
-* { font-family: 'Segoe UI', 'Inter', sans-serif; }
-
-QMainWindow, QWidget#centralWidget {
-    background-color: #f7f6f2;
-    color: #28251d;
+APP_STYLESHEET = """
+/* ─── Global ─────────────────────────────────────────────── */
+* {
+    font-family: "Segoe UI", "Inter", "Helvetica Neue", Arial, sans-serif;
+    font-size: 13px;
+    color: #e2e2e2;
+    outline: none;
 }
 
-/* ── Sidebar ── */
+QMainWindow, QWidget#central_widget {
+    background-color: #111318;
+}
+
+/* ─── Sidebar ─────────────────────────────────────────────── */
 QWidget#sidebar {
-    background-color: #1c1b19;
-    min-width: 200px;
-    max-width: 200px;
+    background-color: #16181f;
+    border-right: 1px solid #242630;
+    min-width: 220px;
+    max-width: 220px;
 }
-QLabel#sidebarLogo {
-    color: #f9f8f5;
+
+QLabel#app_title {
     font-size: 15px;
-    font-weight: 700;
-    padding: 20px 16px 8px 16px;
-}
-QLabel#sidebarVersion {
-    color: #5a5957;
-    font-size: 11px;
-    padding: 0 16px 16px 16px;
-}
-QPushButton#navBtn {
-    background: transparent;
-    color: #797876;
-    border: none;
-    border-radius: 6px;
-    padding: 10px 16px;
-    text-align: left;
-    font-size: 13px;
-}
-QPushButton#navBtn:hover { background: #262523; color: #cdccca; }
-QPushButton#navBtnActive {
-    background: #313b3b;
-    color: #4f98a3;
-    border: none;
-    border-radius: 6px;
-    padding: 10px 16px;
-    text-align: left;
-    font-size: 13px;
     font-weight: 600;
+    color: #ffffff;
+    padding: 0px 4px;
+    letter-spacing: 0.5px;
 }
-QLabel#userLabel {
-    color: #797876;
+
+QLabel#app_subtitle {
     font-size: 11px;
-    padding: 4px 16px;
+    color: #6b7280;
+    padding: 0px 4px;
 }
-QPushButton#logoutBtn {
-    background: transparent;
-    color: #797876;
+
+/* ─── Nav buttons ─────────────────────────────────────────── */
+QPushButton#nav_btn {
+    background-color: transparent;
     border: none;
-    padding: 8px 16px;
-    text-align: left;
-    font-size: 12px;
-}
-QPushButton#logoutBtn:hover { color: #dd6974; }
-
-/* ── Cards & Frames ── */
-QFrame#kpiCard, QFrame#chartCard, QFrame#insightCard {
-    background: #f9f8f5;
-    border: 1px solid rgba(40,37,29,0.10);
-    border-radius: 10px;
-}
-QFrame#insightCard { padding: 4px; }
-
-/* ── Login ── */
-QFrame#loginCard {
-    background: #f9f8f5;
-    border: 1px solid rgba(40,37,29,0.12);
-    border-radius: 14px;
-}
-QLabel#appTitle    { font-size: 20px; font-weight: 700; color: #28251d; }
-QLabel#appSubtitle { font-size: 12px; color: #7a7974; }
-
-/* ── Tabs on login ── */
-QPushButton#tabActive {
-    background: #01696f;
-    color: white;
-    border: none;
-    border-radius: 6px;
-    padding: 8px 20px;
-    font-weight: 600;
-}
-QPushButton#tabInactive {
-    background: #f3f0ec;
-    color: #7a7974;
-    border: none;
-    border-radius: 6px;
-    padding: 8px 20px;
-}
-QPushButton#tabInactive:hover { background: #edeae5; color: #28251d; }
-
-/* ── Inputs ── */
-QLineEdit#inputField, QComboBox#comboField {
-    background: white;
-    border: 1px solid #d4d1ca;
-    border-radius: 6px;
-    padding: 6px 10px;
-    font-size: 13px;
-    color: #28251d;
-}
-QLineEdit#inputField:focus, QComboBox#comboField:focus {
-    border-color: #01696f;
-}
-
-/* ── Buttons ── */
-QPushButton#primaryBtn {
-    background: #01696f;
-    color: white;
-    border: none;
-    border-radius: 7px;
-    padding: 8px 20px;
-    font-size: 13px;
-    font-weight: 600;
-}
-QPushButton#primaryBtn:hover    { background: #0c4e54; }
-QPushButton#primaryBtn:disabled { background: #bab9b4; }
-
-QPushButton#secondaryBtn {
-    background: #f3f0ec;
-    color: #28251d;
-    border: 1px solid #d4d1ca;
-    border-radius: 7px;
-    padding: 8px 16px;
-    font-size: 13px;
-}
-QPushButton#secondaryBtn:hover { background: #edeae5; }
-
-QPushButton#ghostBtn {
-    background: transparent;
-    color: #7a7974;
-    border: 1px solid #dcd9d5;
-    border-radius: 6px;
-    padding: 6px 14px;
-    font-size: 12px;
-}
-QPushButton#ghostBtn:hover { background: #f3f0ec; color: #28251d; }
-
-QPushButton#tableActionBtn {
-    background: #f3f0ec;
-    color: #01696f;
-    border: none;
-    border-radius: 4px;
-    padding: 2px 10px;
-    font-size: 11px;
-}
-QPushButton#tableActionBtnDanger {
-    background: #f3f0ec;
-    color: #a12c7b;
-    border: none;
-    border-radius: 4px;
-    padding: 2px 10px;
-    font-size: 11px;
-}
-QPushButton#suggestedBtn {
-    background: #f3f0ec;
-    color: #7a7974;
-    border: 1px solid #dcd9d5;
-    border-radius: 14px;
-    padding: 2px 12px;
-    font-size: 11px;
-}
-QPushButton#suggestedBtn:hover { background: #cedcd8; color: #01696f; }
-
-/* ── Table ── */
-QTableWidget#receiptsTable {
-    background: white;
-    border: 1px solid #dcd9d5;
     border-radius: 8px;
-    gridline-color: #f3f0ec;
-    font-size: 12px;
+    padding: 10px 14px;
+    text-align: left;
+    color: #9ca3af;
+    font-size: 13px;
+    font-weight: 400;
 }
-QTableWidget#receiptsTable::item:selected {
-    background: #cedcd8;
-    color: #28251d;
+
+QPushButton#nav_btn:hover {
+    background-color: #1f2330;
+    color: #e2e2e2;
+}
+
+QPushButton#nav_btn[active="true"] {
+    background-color: #1e2a3a;
+    color: #60a5fa;
+    font-weight: 500;
+}
+
+QPushButton#nav_btn[active="true"]:hover {
+    background-color: #1e2a3a;
+}
+
+/* ─── Logout button ───────────────────────────────────────── */
+QPushButton#logout_btn {
+    background-color: transparent;
+    border: 1px solid #2d3041;
+    border-radius: 8px;
+    padding: 8px 14px;
+    color: #6b7280;
+    font-size: 12px;
+    text-align: left;
+}
+
+QPushButton#logout_btn:hover {
+    background-color: #2a1a1a;
+    border-color: #7f1d1d;
+    color: #fca5a5;
+}
+
+/* ─── Content area ────────────────────────────────────────── */
+QWidget#content_area {
+    background-color: #111318;
+}
+
+QStackedWidget {
+    background-color: #111318;
+    border: none;
+}
+
+/* ─── User info bar ───────────────────────────────────────── */
+QLabel#user_label {
+    font-size: 12px;
+    color: #6b7280;
+    padding: 2px 4px;
+}
+
+QFrame#sidebar_divider {
+    background-color: #242630;
+    min-height: 1px;
+    max-height: 1px;
+    border: none;
+}
+
+/* ─── Scrollbars ──────────────────────────────────────────── */
+QScrollBar:vertical {
+    background: #111318;
+    width: 6px;
+    margin: 0;
+    border-radius: 3px;
+}
+QScrollBar::handle:vertical {
+    background: #2d3041;
+    border-radius: 3px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #3d4155;
+}
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0;
+    background: none;
+}
+
+QScrollBar:horizontal {
+    background: #111318;
+    height: 6px;
+    border-radius: 3px;
+}
+QScrollBar::handle:horizontal {
+    background: #2d3041;
+    border-radius: 3px;
+    min-width: 30px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #3d4155;
+}
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0;
+    background: none;
+}
+
+/* ─── Inputs ──────────────────────────────────────────────── */
+QLineEdit, QTextEdit, QPlainTextEdit {
+    background-color: #1a1d27;
+    border: 1px solid #2d3041;
+    border-radius: 8px;
+    padding: 8px 12px;
+    color: #e2e2e2;
+    selection-background-color: #1e3a5f;
+}
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
+    border-color: #3b82f6;
+    background-color: #1c2032;
+}
+QLineEdit::placeholder {
+    color: #4b5563;
+}
+
+/* ─── Buttons (general) ───────────────────────────────────── */
+QPushButton {
+    background-color: #1f2330;
+    border: 1px solid #2d3041;
+    border-radius: 8px;
+    padding: 8px 18px;
+    color: #e2e2e2;
+    font-size: 13px;
+}
+QPushButton:hover {
+    background-color: #252b3d;
+    border-color: #3b82f6;
+}
+QPushButton:pressed {
+    background-color: #1a2035;
+}
+QPushButton:disabled {
+    color: #4b5563;
+    border-color: #1f2330;
+    background-color: #16181f;
+}
+
+QPushButton#primary_btn {
+    background-color: #2563eb;
+    border: none;
+    color: #ffffff;
+    font-weight: 500;
+}
+QPushButton#primary_btn:hover {
+    background-color: #1d4fd8;
+}
+QPushButton#primary_btn:pressed {
+    background-color: #1e40af;
+}
+QPushButton#primary_btn:disabled {
+    background-color: #1e2a4a;
+    color: #6b7280;
+}
+
+/* ─── Tables ──────────────────────────────────────────────── */
+QTableWidget {
+    background-color: #16181f;
+    border: 1px solid #242630;
+    border-radius: 8px;
+    gridline-color: #1f2330;
+    alternate-background-color: #1a1d27;
+}
+QTableWidget::item {
+    padding: 8px 10px;
+    border: none;
+    color: #d1d5db;
+}
+QTableWidget::item:selected {
+    background-color: #1e3a5f;
+    color: #ffffff;
 }
 QHeaderView::section {
-    background: #f3f0ec;
-    border: none;
-    padding: 6px 10px;
+    background-color: #1f2330;
+    color: #9ca3af;
     font-size: 12px;
-    font-weight: 600;
-    color: #7a7974;
+    font-weight: 500;
+    padding: 8px 10px;
+    border: none;
+    border-bottom: 1px solid #2d3041;
 }
 
-/* ── Drop Zone ── */
-QFrame#dropZone {
-    background: #f9f8f5;
-    border: 2px dashed #d4d1ca;
-    border-radius: 12px;
+/* ─── ComboBox ────────────────────────────────────────────── */
+QComboBox {
+    background-color: #1a1d27;
+    border: 1px solid #2d3041;
+    border-radius: 8px;
+    padding: 7px 12px;
+    color: #e2e2e2;
+    min-width: 120px;
 }
-QFrame#dropZoneActive {
-    background: #cedcd8;
-    border: 2px dashed #01696f;
-    border-radius: 12px;
+QComboBox:hover {
+    border-color: #3b82f6;
 }
-
-/* ── Chat Bubbles ── */
-QFrame#userBubble QLabel#bubbleText {
-    background: #01696f;
-    color: white;
-    border-radius: 12px;
-    padding: 10px 14px;
-    font-size: 13px;
+QComboBox::drop-down {
+    border: none;
+    padding-right: 8px;
 }
-QFrame#aiBubble QLabel#bubbleText {
-    background: white;
-    color: #28251d;
-    border: 1px solid #dcd9d5;
-    border-radius: 12px;
-    padding: 10px 14px;
-    font-size: 13px;
+QComboBox QAbstractItemView {
+    background-color: #1a1d27;
+    border: 1px solid #2d3041;
+    border-radius: 8px;
+    color: #e2e2e2;
+    selection-background-color: #1e3a5f;
+    outline: none;
 }
 
-/* ── Labels ── */
-QLabel#viewTitle      { font-size: 16px; font-weight: 700; color: #28251d; }
-QLabel#viewSubtitle   { font-size: 13px; color: #7a7974; }
-QLabel#sectionLabel   { font-size: 13px; font-weight: 600; color: #28251d; }
-QLabel#statusLabel    { font-size: 12px; color: #7a7974; }
-QLabel#placeholderText{ font-size: 13px; color: #bab9b4; }
-QLabel#kpiTitle       { font-size: 11px; color: #7a7974; }
-QLabel#pageInfo       { font-size: 12px; color: #7a7974; }
-QLabel#insightTitle   { font-size: 11px; font-weight: 600; }
-QLabel#insightDesc    { font-size: 13px; color: #28251d; }
-QLabel#catLabel       { font-size: 13px; color: #28251d; }
-QLabel#catAmount      { font-size: 12px; color: #7a7974; }
-QLabel#rankLabel      { font-size: 12px; font-weight: 700; color: #7a7974; }
-QLabel#categoryBadge  {
-    background: #f3f0ec;
-    color: #01696f;
-    border-radius: 10px;
-    padding: 2px 8px;
-    font-size: 11px;
-}
-QLabel#confBadge { font-size: 11px; color: #7a7974; }
-QLabel#dropHint  { font-size: 13px; color: #7a7974; }
-QLabel#dropTypes { font-size: 11px; color: #bab9b4; }
-
-/* ── Progress ── */
-QProgressBar#uploadProgress {
-    background: #f3f0ec;
-    border-radius: 4px;
+/* ─── Label variants ──────────────────────────────────────── */
+QLabel {
+    background: transparent;
     border: none;
 }
-QProgressBar#uploadProgress::chunk {
-    background: #01696f;
+QLabel#section_title {
+    font-size: 16px;
+    font-weight: 600;
+    color: #ffffff;
+    padding-bottom: 4px;
+}
+QLabel#muted {
+    color: #6b7280;
+    font-size: 12px;
+}
+QLabel#kpi_value {
+    font-size: 22px;
+    font-weight: 600;
+    color: #ffffff;
+}
+QLabel#kpi_label {
+    font-size: 11px;
+    color: #6b7280;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* ─── Cards ───────────────────────────────────────────────── */
+QFrame#card {
+    background-color: #16181f;
+    border: 1px solid #242630;
+    border-radius: 12px;
+    padding: 16px;
+}
+
+/* ─── Progress bar ────────────────────────────────────────── */
+QProgressBar {
+    background-color: #1f2330;
+    border: 1px solid #2d3041;
+    border-radius: 4px;
+    height: 6px;
+    text-align: center;
+    color: transparent;
+}
+QProgressBar::chunk {
+    background-color: #2563eb;
     border-radius: 4px;
 }
 
-/* ── Status bar ── */
-QStatusBar { background: #f3f0ec; font-size: 11px; color: #7a7974; }
+/* ─── Tooltip ─────────────────────────────────────────────── */
+QToolTip {
+    background-color: #1a1d27;
+    color: #e2e2e2;
+    border: 1px solid #2d3041;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+}
 """
+
+
+NAV_ITEMS = [
+    ("Upload",     "UploadView"),
+    ("Receipts",   "ReceiptsView"),
+    ("Analytics",  "AnalyticsView"),
+    ("Insights",   "InsightsView"),
+    ("Ask AI",     "AskView"),
+]
+
+
+class SidebarDivider(QFrame):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("sidebar_divider")
+        self.setFixedHeight(1)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self._current_user = None
-        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
-        self.setMinimumSize(1060, 680)
-        self._setup_ui()
-        self._check_server()
+        self.setWindowTitle("Vispend AI")
+        self.resize(1260, 800)
+        self.setMinimumSize(960, 620)
 
-    def _setup_ui(self):
+        self._nav_buttons: list[QPushButton] = []
+        self._current_user: dict = {}
+
         central = QWidget()
-        central.setObjectName("centralWidget")
+        central.setObjectName("central_widget")
         self.setCentralWidget(central)
 
         self._root_stack = QStackedWidget()
+
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
         root_layout.addWidget(self._root_stack)
 
-        # Page 0: Login
-        self._login_view = LoginView()
-        self._login_view.login_success.connect(self._on_login)
-        self._root_stack.addWidget(self._login_view)
-
-        # Page 1: Main app
-        self._app_widget = self._build_app_widget()
-        self._root_stack.addWidget(self._app_widget)
+        self._build_auth_screen()
+        self._build_app_shell()
 
         self._root_stack.setCurrentIndex(0)
-        self.statusBar().showMessage("Checking server…")
 
-    def _build_app_widget(self) -> QWidget:
-        widget = QWidget()
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+    # ──────────────────────────────────────────────────────────
+    # Auth screen
+    # ──────────────────────────────────────────────────────────
 
-        # ── Sidebar ──
-        sidebar = QWidget()
-        sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(200)
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar_layout.setSpacing(2)
+    def _build_auth_screen(self) -> None:
+        self._auth_container = QStackedWidget()
 
-        logo = QLabel("🧾 Receipt Analyzer")
-        logo.setObjectName("sidebarLogo")
-        sidebar_layout.addWidget(logo)
+        self._login_view = LoginView()
+        self._register_view = RegisterView()
 
-        ver = QLabel(f"v{APP_VERSION}")
-        ver.setObjectName("sidebarVersion")
-        sidebar_layout.addWidget(ver)
+        self._auth_container.addWidget(self._login_view)
+        self._auth_container.addWidget(self._register_view)
+        self._auth_container.setCurrentIndex(0)
 
-        self._nav_buttons = []
-        nav_items = [
-            ("  Upload",    0),
-            ("  Receipts",  1),
-            ("  Analytics", 2),
-            ("  Insights",  3),
-            ("  Ask AI",    4),
-        ]
-        for label, index in nav_items:
-            btn = QPushButton(label)
-            btn.setObjectName("navBtn")
-            btn.clicked.connect(lambda _, i=index: self._switch_tab(i))
-            sidebar_layout.addWidget(btn)
-            self._nav_buttons.append(btn)
+        self._login_view.login_success.connect(self._on_login_success)
+        self._login_view.switch_to_register.connect(self._show_register)
+        self._register_view.register_success.connect(self._on_login_success)
+        self._register_view.switch_to_login.connect(self._show_login)
 
-        sidebar_layout.addStretch()
+        self._root_stack.addWidget(self._auth_container)
 
-        self._user_label = QLabel("")
-        self._user_label.setObjectName("userLabel")
-        self._user_label.setWordWrap(True)
-        sidebar_layout.addWidget(self._user_label)
+    def _show_login(self) -> None:
+        self._auth_container.setCurrentWidget(self._login_view)
 
-        btn_logout = QPushButton("Sign Out")
-        btn_logout.setObjectName("logoutBtn")
-        btn_logout.clicked.connect(self._logout)
-        sidebar_layout.addWidget(btn_logout)
+    def _show_register(self) -> None:
+        self._auth_container.setCurrentWidget(self._register_view)
 
-        layout.addWidget(sidebar)
+    # ──────────────────────────────────────────────────────────
+    # App shell
+    # ──────────────────────────────────────────────────────────
 
-        # ── Content stack ──
-        self._content_stack  = QStackedWidget()
+    def _build_app_shell(self) -> None:
+        shell = QWidget()
+        shell.setObjectName("central_widget")
+        shell_layout = QHBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+
+        self._sidebar = self._build_sidebar()
+        shell_layout.addWidget(self._sidebar)
+
+        self._content_stack = QStackedWidget()
+        self._content_stack.setObjectName("content_area")
+
         self._upload_view    = UploadView()
         self._receipts_view  = ReceiptsView()
         self._analytics_view = AnalyticsView()
         self._insights_view  = InsightsView()
         self._ask_view       = AskView()
-
-        self._upload_view.upload_complete.connect(self._on_upload_complete)
 
         for view in (
             self._upload_view,
@@ -387,67 +456,140 @@ class MainWindow(QMainWindow):
         ):
             self._content_stack.addWidget(view)
 
-        layout.addWidget(self._content_stack, 1)
-        return widget
+        shell_layout.addWidget(self._content_stack, stretch=1)
 
-    def _switch_tab(self, index: int):
+        self._root_stack.addWidget(shell)
+
+        self._upload_view.upload_complete.connect(self._on_upload_complete)
+
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QWidget()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(220)
+
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(12, 20, 12, 16)
+        layout.setSpacing(0)
+
+        title_label = QLabel("Vispend AI")
+        title_label.setObjectName("app_title")
+        subtitle_label = QLabel("Receipt Manager")
+        subtitle_label.setObjectName("app_subtitle")
+
+        layout.addWidget(title_label)
+        layout.addWidget(subtitle_label)
+        layout.addSpacing(20)
+        layout.addWidget(SidebarDivider())
+        layout.addSpacing(12)
+
+        for index, (label, _) in enumerate(NAV_ITEMS):
+            btn = QPushButton(label)
+            btn.setObjectName("nav_btn")
+            btn.setProperty("active", "false")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda checked, i=index: self._navigate(i))
+            layout.addWidget(btn)
+            layout.addSpacing(2)
+            self._nav_buttons.append(btn)
+
+        layout.addStretch()
+        layout.addWidget(SidebarDivider())
+        layout.addSpacing(12)
+
+        self._user_label = QLabel("")
+        self._user_label.setObjectName("user_label")
+        self._user_label.setWordWrap(True)
+        layout.addWidget(self._user_label)
+        layout.addSpacing(8)
+
+        logout_btn = QPushButton("Sign out")
+        logout_btn.setObjectName("logout_btn")
+        logout_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        logout_btn.clicked.connect(self._on_logout)
+        layout.addWidget(logout_btn)
+
+        return sidebar
+
+    # ──────────────────────────────────────────────────────────
+    # Navigation
+    # ──────────────────────────────────────────────────────────
+
+    def _navigate(self, index: int) -> None:
         self._content_stack.setCurrentIndex(index)
         for i, btn in enumerate(self._nav_buttons):
-            btn.setObjectName("navBtnActive" if i == index else "navBtn")
+            btn.setProperty("active", "true" if i == index else "false")
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
-    def _on_login(self, data: dict):
-        # Fix 2: payload is {"access_token": ..., "user": {...}}
-        # extract user sub-dict safely
-        user = data.get("user", {})
-        if not isinstance(user, dict):
-            user = {}
-        self._current_user = user
-        api.set_token(data["access_token"])
+        self._on_view_activated(index)
 
-        name = user.get("full_name") or user.get("username") or "User"
-        self._user_label.setText(f"Signed in as\n{name}")
-        self._root_stack.setCurrentIndex(1)
-        self._switch_tab(0)
-        self.statusBar().showMessage(f"Welcome, {name}!", 4000)
-        QTimer.singleShot(300, self._receipts_view.refresh)
+    def _on_view_activated(self, index: int) -> None:
+        view = self._content_stack.widget(index)
+        if hasattr(view, "refresh"):
+            try:
+                view.refresh()
+            except Exception as exc:
+                logger.warning("View refresh error at index %d: %s", index, exc)
 
-    def _logout(self):
-        api.logout()
-        self._current_user = None
-        self._root_stack.setCurrentIndex(0)
-        self.statusBar().showMessage("Signed out.")
+    # ──────────────────────────────────────────────────────────
+    # Auth handlers
+    # ──────────────────────────────────────────────────────────
 
-    def _on_upload_complete(self):
-        self._receipts_view.refresh()
-        self._switch_tab(1)
-        self.statusBar().showMessage(
-            "Upload complete — receipts are being processed.", 5000
+    @Slot(dict)
+    def _on_login_success(self, payload: dict) -> None:
+        self._current_user = payload
+
+        user_info = payload.get("user", {})
+        display_name = (
+            user_info.get("full_name")
+            or user_info.get("username")
+            or user_info.get("email")
+            or "User"
         )
+        self._user_label.setText(display_name)
 
-    def _check_server(self):
-        worker = HealthCheckWorker()
-        worker.finished.connect(self._on_health)
-        worker.start()
+        self._root_stack.setCurrentIndex(1)
+        self._navigate(0)
+        logger.info("User signed in: %s", display_name)
 
-    def _on_health(self, data: dict):
-        if data.get("healthy"):
-            self.statusBar().showMessage("✓ Server connected", 4000)
-        else:
-            self.statusBar().showMessage(
-                "✗ Cannot reach server — check that the backend is running."
-            )
+    @Slot()
+    def _on_logout(self) -> None:
+        api.clear_token()
+        self._current_user = {}
+        self._user_label.setText("")
+
+        for i, btn in enumerate(self._nav_buttons):
+            btn.setProperty("active", "false")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+        self._show_login()
+        self._root_stack.setCurrentIndex(0)
+        logger.info("User signed out")
+
+    # ──────────────────────────────────────────────────────────
+    # Cross-view signals
+    # ──────────────────────────────────────────────────────────
+
+    @Slot()
+    def _on_upload_complete(self) -> None:
+        if hasattr(self._receipts_view, "refresh"):
+            self._receipts_view.refresh()
 
 
-def run():
+def main() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    app.setStyleSheet(STYLESHEET)
+    app.setApplicationName("Vispend AI")
+    app.setApplicationVersion("1.0.0")
+    app.setOrganizationName("Vispend")
+    app.setStyle("Fusion")
+    app.setStyleSheet(APP_STYLESHEET)
+
     window = MainWindow()
     window.show()
+
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    run()
+    main()
