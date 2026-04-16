@@ -1,6 +1,7 @@
 # src/desktop/views.py
 
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -9,11 +10,21 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QThreadPool,
+    QTimer,
     QUrl,
     Signal,
     Slot,
 )
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QFont
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QPainter,
+    QPainterPath,
+    QPen,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -50,6 +61,7 @@ from desktop.workers import (
     make_ask_advisor_worker,
     make_auto_insights_worker,
     make_delete_receipt_worker,
+    make_get_receipt_worker,
     make_insights_worker,
     make_list_receipts_worker,
     make_login_worker,
@@ -87,6 +99,24 @@ PERIOD_OPTIONS = [
     ("This Year",  "year"),
     ("All Time",   "all"),
 ]
+
+# Distinct, vibrant category colours used in charts
+CATEGORY_COLORS: dict[str, str] = {
+    "Groceries":     "#34d399",   # emerald
+    "Dining":        "#f97316",   # orange
+    "Transport":     "#60a5fa",   # blue
+    "Utilities":     "#a78bfa",   # violet
+    "Healthcare":    "#f472b6",   # pink
+    "Shopping":      "#facc15",   # yellow
+    "Entertainment": "#fb7185",   # rose
+    "Education":     "#38bdf8",   # sky
+    "Travel":        "#4ade80",   # green
+    "Finance":       "#e879f9",   # fuchsia
+    "Other":         "#94a3b8",   # slate
+}
+
+def _category_color(category: str) -> str:
+    return CATEGORY_COLORS.get(category, "#6b7280")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -128,10 +158,11 @@ def _make_primary_button(text: str) -> QPushButton:
 
 
 class KpiCard(QFrame):
-    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+    def __init__(self, title: str, accent: str = "#60a5fa", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("card")
         self.setMinimumWidth(160)
+        self._accent = accent
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
@@ -142,6 +173,7 @@ class KpiCard(QFrame):
 
         self._value = QLabel("—")
         self._value.setObjectName("kpi_value")
+        self._value.setStyleSheet(f"color: {accent}; font-size: 22px; font-weight: 700;")
 
         layout.addWidget(self._title)
         layout.addWidget(self._value)
@@ -150,12 +182,278 @@ class KpiCard(QFrame):
         self._value.setText(value)
 
 
-class SimpleBarChart(QWidget):
+# ──────────────────────────────────────────────────────────────────────────────
+# Pie Chart Widget (QPainter based, no external deps)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class PieChartWidget(QWidget):
     """
-    A minimal canvas-free bar chart drawn with QFrame widgets.
-    Uses proportional height bars inside a fixed container.
+    Draws a coloured donut pie chart for category breakdown.
+    Pass a list of dicts with 'category', 'amount', 'percentage'.
     """
 
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._data: list[dict] = []
+        self.setMinimumSize(260, 260)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_data(self, data: list[dict]) -> None:
+        self._data = [d for d in data if float(d.get("amount", 0) or 0) > 0]
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+        side = min(w, h) - 20
+        cx = w // 2
+        cy = h // 2
+        r_outer = side // 2
+        r_inner = int(r_outer * 0.52)
+
+        if not self._data:
+            painter.setPen(QColor("#4b5563"))
+            painter.drawText(0, 0, w, h, Qt.AlignmentFlag.AlignCenter, "No data")
+            return
+
+        total = sum(float(d.get("amount", 0) or 0) for d in self._data)
+        if total == 0:
+            return
+
+        start_angle = 90 * 16  # QPainter angles are in 1/16 degree units, start at top
+
+        for item in self._data:
+            amount = float(item.get("amount", 0) or 0)
+            span = int((amount / total) * 360 * 16)
+            color = QColor(_category_color(item.get("category", "Other")))
+
+            # Draw outer arc slice
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(color))
+            painter.drawPie(cx - r_outer, cy - r_outer, r_outer * 2, r_outer * 2, start_angle, span)
+            start_angle += span
+
+        # Draw inner circle to make it a donut
+        painter.setBrush(QBrush(QColor("#14161f")))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(cx - r_inner, cy - r_inner, r_inner * 2, r_inner * 2)
+
+        # Center text: total
+        painter.setPen(QColor("#ffffff"))
+        font = painter.font()
+        font.setPointSize(10)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(cx - r_inner, cy - 12, r_inner * 2, 24,
+                         Qt.AlignmentFlag.AlignCenter, "TOTAL")
+        font.setPointSize(9)
+        font.setBold(False)
+        painter.setFont(font)
+        painter.setPen(QColor("#9ca3af"))
+        total_text = f"{total:,.0f}"
+        painter.drawText(cx - r_inner, cy + 2, r_inner * 2, 20,
+                         Qt.AlignmentFlag.AlignCenter, total_text)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Legend Widget for pie chart
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class PieLegend(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(8, 8, 8, 8)
+        self._layout.setSpacing(5)
+
+    def set_data(self, data: list[dict]) -> None:
+        while self._layout.count():
+            child = self._layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        for item in data[:10]:
+            cat = item.get("category", "Other")
+            amount = float(item.get("amount", 0) or 0)
+            pct = float(item.get("percentage", 0) or 0)
+            color = _category_color(cat)
+
+            row = QHBoxLayout()
+            row.setSpacing(8)
+
+            dot = QFrame()
+            dot.setFixedSize(12, 12)
+            dot.setStyleSheet(
+                f"background-color: {color}; border-radius: 6px;"
+            )
+            row.addWidget(dot)
+
+            name_lbl = QLabel(cat)
+            name_lbl.setStyleSheet("color: #d1d5db; font-size: 12px;")
+            name_lbl.setMinimumWidth(90)
+            row.addWidget(name_lbl)
+
+            row.addStretch()
+
+            pct_lbl = QLabel(f"{pct:.1f}%")
+            pct_lbl.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600;")
+            pct_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            row.addWidget(pct_lbl)
+
+            amt_lbl = QLabel(f"{amount:,.0f}")
+            amt_lbl.setStyleSheet("color: #6b7280; font-size: 11px;")
+            amt_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            amt_lbl.setMinimumWidth(70)
+            row.addWidget(amt_lbl)
+
+            container = QWidget()
+            container.setLayout(row)
+            self._layout.addWidget(container)
+
+        self._layout.addStretch()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Histogram / Bar Chart Widget (QPainter based)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class BarChartWidget(QWidget):
+    """
+    A proper bar chart drawn with QPainter.
+    Supports category-coloured bars or a single accent colour.
+    Pass items as list[dict] with value_key and label_key.
+    """
+
+    def __init__(
+        self,
+        accent_color: str = "#3b82f6",
+        use_category_colors: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._items: list[dict] = []
+        self._value_key = "amount"
+        self._label_key = "category"
+        self._accent = accent_color
+        self._use_category_colors = use_category_colors
+        self.setMinimumHeight(200)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_data(
+        self,
+        items: list[dict],
+        value_key: str = "amount",
+        label_key: str = "category",
+    ) -> None:
+        self._items = items[:12]
+        self._value_key = value_key
+        self._label_key = label_key
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+
+        pad_left = 58
+        pad_right = 12
+        pad_top = 16
+        pad_bottom = 46
+
+        chart_w = w - pad_left - pad_right
+        chart_h = h - pad_top - pad_bottom
+
+        if not self._items:
+            painter.setPen(QColor("#4b5563"))
+            painter.drawText(0, 0, w, h, Qt.AlignmentFlag.AlignCenter, "No data")
+            return
+
+        values = [float(item.get(self._value_key, 0) or 0) for item in self._items]
+        max_val = max(values) if values else 1
+        if max_val == 0:
+            max_val = 1
+
+        # Draw grid lines
+        grid_steps = 4
+        painter.setPen(QPen(QColor("#242630"), 1))
+        font = painter.font()
+        font.setPointSize(8)
+        painter.setFont(font)
+
+        for i in range(grid_steps + 1):
+            y = pad_top + chart_h - int((i / grid_steps) * chart_h)
+            painter.setPen(QPen(QColor("#242630"), 1))
+            painter.drawLine(pad_left, y, pad_left + chart_w, y)
+
+            # Y axis labels
+            grid_val = (max_val / grid_steps) * i
+            painter.setPen(QColor("#6b7280"))
+            label = f"{grid_val:,.0f}" if grid_val < 10000 else f"{grid_val/1000:.0f}k"
+            painter.drawText(0, y - 8, pad_left - 4, 16,
+                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                             label)
+
+        # Draw bars
+        n = len(self._items)
+        group_w = chart_w / n
+        bar_w = max(8, int(group_w * 0.55))
+
+        for i, item in enumerate(self._items):
+            val = float(item.get(self._value_key, 0) or 0)
+            bar_h = int((val / max_val) * chart_h)
+            x = pad_left + int(i * group_w + (group_w - bar_w) / 2)
+            y = pad_top + chart_h - bar_h
+
+            if self._use_category_colors:
+                color = QColor(_category_color(item.get(self._label_key, "Other")))
+            else:
+                color = QColor(self._accent)
+
+            # Bar body
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(color))
+            radius = min(4, bar_w // 3)
+            rect_path = QPainterPath()
+            rect_path.addRoundedRect(x, y, bar_w, bar_h, radius, radius)
+            painter.drawPath(rect_path)
+
+            # Value label above bar
+            if bar_h > 14:
+                painter.setPen(QColor("#9ca3af"))
+                val_font = painter.font()
+                val_font.setPointSize(7)
+                painter.setFont(val_font)
+                val_text = f"{val:,.0f}" if val < 10000 else f"{val/1000:.1f}k"
+                painter.drawText(x - 4, y - 14, bar_w + 8, 12,
+                                 Qt.AlignmentFlag.AlignHCenter, val_text)
+
+            # X axis label
+            label_text = str(item.get(self._label_key, ""))[:10]
+            painter.setPen(QColor("#6b7280"))
+            lbl_font = painter.font()
+            lbl_font.setPointSize(8)
+            painter.setFont(lbl_font)
+            painter.drawText(
+                x - 10, pad_top + chart_h + 6, bar_w + 20, 36,
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                label_text,
+            )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Legacy SimpleBarChart kept for compatibility
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class SimpleBarChart(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._layout = QHBoxLayout(self)
@@ -183,6 +481,7 @@ class SimpleBarChart(QWidget):
             value = float(item.get(value_key, 0) or 0)
             label_text = str(item.get(label_key, ""))[:14]
             bar_height = max(4, int((value / max_value) * max_bar_height))
+            color = _category_color(item.get(label_key, "Other")) if label_key == "category" else "#2563eb"
 
             col = QWidget()
             col_layout = QVBoxLayout(col)
@@ -193,9 +492,7 @@ class SimpleBarChart(QWidget):
             bar = QFrame()
             bar.setFixedWidth(28)
             bar.setFixedHeight(bar_height)
-            bar.setStyleSheet(
-                "background-color: #2563eb; border-radius: 4px;"
-            )
+            bar.setStyleSheet(f"background-color: {color}; border-radius: 4px;")
 
             amount_label = QLabel(f"{value:,.0f}")
             amount_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -459,7 +756,7 @@ class RegisterView(QWidget):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# UploadView
+# UploadView  — BUG 4 FIX: polls each uploaded receipt until processing done
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -517,9 +814,15 @@ class UploadView(QWidget):
 
     ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".pdf"}
 
+    # How often to poll (ms) and how many attempts before giving up
+    POLL_INTERVAL_MS = 2500
+    POLL_MAX_ATTEMPTS = 20
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._queued_files: list[Path] = []
+        # Maps receipt_id -> {filename, attempts, timer}
+        self._polling: dict[int, dict] = {}
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -645,10 +948,95 @@ class UploadView(QWidget):
         worker.signals.finished.connect(self._on_all_done)
         POOL.start(worker)
 
+    # ── BUG 4 FIX ─────────────────────────────────────────────────────────────
+    # After upload API returns, the receipt is still "pending" — OCR runs in a
+    # background task on the server. We start a per-receipt polling timer that
+    # checks every POLL_INTERVAL_MS until status == "done" or "failed",
+    # then updates the row and emits upload_complete to refresh other views.
+    # ──────────────────────────────────────────────────────────────────────────
+
     @Slot(str, object)
     def _on_file_done(self, filename: str, receipt: Any) -> None:
-        self._update_status_row(filename, "Uploaded", "#4ade80")
-        self.upload_complete.emit()
+        """File was saved on server. Now poll until OCR processing finishes."""
+        receipt_id = receipt.get("id") if isinstance(receipt, dict) else None
+
+        if receipt_id is None:
+            # No ID returned — fall back to original simple behaviour
+            self._update_status_row(filename, "Uploaded ✓", "#4ade80")
+            self.upload_complete.emit()
+            return
+
+        self._update_status_row(filename, "Processing…", "#facc15")
+
+        timer = QTimer(self)
+        timer.setSingleShot(False)
+        self._polling[receipt_id] = {
+            "filename": filename,
+            "attempts": 0,
+            "timer": timer,
+        }
+
+        # Capture receipt_id in closure
+        timer.timeout.connect(lambda rid=receipt_id: self._poll_receipt(rid))
+        timer.start(self.POLL_INTERVAL_MS)
+
+    def _poll_receipt(self, receipt_id: int) -> None:
+        poll_info = self._polling.get(receipt_id)
+        if poll_info is None:
+            return
+
+        poll_info["attempts"] += 1
+        if poll_info["attempts"] > self.POLL_MAX_ATTEMPTS:
+            self._stop_polling(receipt_id, timeout=True)
+            return
+
+        worker = make_get_receipt_worker(receipt_id)
+        worker.signals.result.connect(lambda data, rid=receipt_id: self._on_poll_result(rid, data))
+        worker.signals.error.connect(lambda _err, rid=receipt_id: None)  # silently retry
+        POOL.start(worker)
+
+    @Slot(int, object)
+    def _on_poll_result(self, receipt_id: int, data: Any) -> None:
+        poll_info = self._polling.get(receipt_id)
+        if poll_info is None or not isinstance(data, dict):
+            return
+
+        status = data.get("processing_status", "")
+        filename = poll_info["filename"]
+
+        if status == "done":
+            merchant = data.get("merchant") or "Unknown merchant"
+            amount = data.get("total_amount")
+            amount_str = f"{float(amount):,.2f}" if amount is not None else "—"
+            currency = data.get("currency") or ""
+            self._update_status_row(
+                filename,
+                f"Done ✓  {merchant}  {currency} {amount_str}",
+                "#4ade80",
+            )
+            self._stop_polling(receipt_id)
+            self.upload_complete.emit()
+
+        elif status == "failed":
+            self._update_status_row(filename, "Processing failed", "#f87171")
+            self._stop_polling(receipt_id)
+            self.upload_complete.emit()
+
+        # If still "pending" or "processing", keep polling until timeout
+
+    def _stop_polling(self, receipt_id: int, timeout: bool = False) -> None:
+        poll_info = self._polling.pop(receipt_id, None)
+        if poll_info:
+            poll_info["timer"].stop()
+            if timeout:
+                self._update_status_row(
+                    poll_info["filename"],
+                    "Uploaded (processing taking longer than expected)",
+                    "#fb923c",
+                )
+                self.upload_complete.emit()
+
+    # ── end BUG 4 FIX ─────────────────────────────────────────────────────────
 
     @Slot(str, str)
     def _on_file_error(self, filename: str, message: str) -> None:
@@ -874,6 +1262,13 @@ class ReceiptsView(QWidget):
         page     = payload.get("page", 1)
         pages    = payload.get("pages") or payload.get("total_pages", 1)
 
+        # Handle nested pagination object
+        if isinstance(payload.get("pagination"), dict):
+            pag = payload["pagination"]
+            total = pag.get("total_items", total)
+            page  = pag.get("page", page)
+            pages = pag.get("total_pages", pages)
+
         self._receipts_cache = receipts
         self._current_page   = page
         self._total_pages    = max(1, pages)
@@ -905,8 +1300,21 @@ class ReceiptsView(QWidget):
             amount_text = f"{float(amount):,.2f}" if amount is not None else "—"
             self._table.setItem(row, 2, QTableWidgetItem(amount_text))
             self._table.setItem(row, 3, QTableWidgetItem(receipt.get("currency") or "—"))
-            self._table.setItem(row, 4, QTableWidgetItem(receipt.get("category") or "—"))
-            self._table.setItem(row, 5, QTableWidgetItem(receipt.get("processing_status") or "—"))
+
+            cat = receipt.get("category") or "—"
+            cat_item = QTableWidgetItem(cat)
+            cat_item.setForeground(QColor(_category_color(cat)))
+            self._table.setItem(row, 4, cat_item)
+
+            proc_status = receipt.get("processing_status") or "—"
+            status_item = QTableWidgetItem(proc_status)
+            if proc_status == "done":
+                status_item.setForeground(QColor("#4ade80"))
+            elif proc_status == "failed":
+                status_item.setForeground(QColor("#f87171"))
+            elif proc_status in ("pending", "processing"):
+                status_item.setForeground(QColor("#facc15"))
+            self._table.setItem(row, 5, status_item)
 
             for col in range(6):
                 item = self._table.item(row, col)
@@ -983,7 +1391,7 @@ class ReceiptsView(QWidget):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# AnalyticsView
+# AnalyticsView — BUG 3 FIX: shows pending_count warning + proper charts
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -1002,6 +1410,7 @@ class AnalyticsView(QWidget):
         layout.setContentsMargins(28, 28, 28, 28)
         layout.setSpacing(20)
 
+        # ── Header row ──────────────────────────────────────────────────────
         header_row = QHBoxLayout()
         header_row.addWidget(_make_section_title("Analytics"))
         header_row.addStretch()
@@ -1015,33 +1424,67 @@ class AnalyticsView(QWidget):
         header_row.addWidget(self._period_combo)
         layout.addLayout(header_row)
 
+        # ── BUG 3 FIX: pending receipts warning banner ───────────────────────
+        self._pending_banner = QLabel("")
+        self._pending_banner.setStyleSheet(
+            "background-color: #2d2000; border: 1px solid #b45309; border-radius: 8px;"
+            " color: #fcd34d; font-size: 12px; padding: 8px 14px;"
+        )
+        self._pending_banner.setWordWrap(True)
+        self._pending_banner.hide()
+        layout.addWidget(self._pending_banner)
+
+        # ── KPI cards ────────────────────────────────────────────────────────
         kpi_row = QHBoxLayout()
         kpi_row.setSpacing(12)
-        self._kpi_total    = KpiCard("Total Spend")
-        self._kpi_count    = KpiCard("Receipts")
-        self._kpi_avg      = KpiCard("Avg Amount")
-        self._kpi_top_cat  = KpiCard("Top Category")
+        self._kpi_total   = KpiCard("Total Spend",   accent="#34d399")
+        self._kpi_count   = KpiCard("Receipts",      accent="#60a5fa")
+        self._kpi_avg     = KpiCard("Avg Amount",    accent="#a78bfa")
+        self._kpi_top_cat = KpiCard("Top Category",  accent="#f97316")
         for kpi in (self._kpi_total, self._kpi_count, self._kpi_avg, self._kpi_top_cat):
             kpi_row.addWidget(kpi)
         layout.addLayout(kpi_row)
 
         layout.addWidget(_make_divider())
 
-        layout.addWidget(QLabel("Spending by Category"))
+        # ── Category breakdown: pie + legend ─────────────────────────────────
+        cat_title = QLabel("Spending by Category")
+        cat_title.setStyleSheet("font-size: 15px; font-weight: 600; color: #e5e7eb;")
+        layout.addWidget(cat_title)
 
-        self._category_chart = SimpleBarChart()
-        layout.addWidget(self._category_chart)
+        cat_row = QHBoxLayout()
+        cat_row.setSpacing(24)
+
+        self._pie_chart = PieChartWidget()
+        self._pie_chart.setFixedSize(260, 260)
+        cat_row.addWidget(self._pie_chart)
+
+        self._pie_legend = PieLegend()
+        self._pie_legend.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        cat_row.addWidget(self._pie_legend)
+
+        layout.addLayout(cat_row)
 
         layout.addWidget(_make_divider())
-        layout.addWidget(QLabel("Monthly Trend"))
 
-        self._trend_chart = SimpleBarChart()
+        # ── Monthly trend histogram ────────────────────────────────────────
+        trend_title = QLabel("Monthly Spend Trend")
+        trend_title.setStyleSheet("font-size: 15px; font-weight: 600; color: #e5e7eb;")
+        layout.addWidget(trend_title)
+
+        self._trend_chart = BarChartWidget(accent_color="#60a5fa", use_category_colors=False)
+        self._trend_chart.setMinimumHeight(220)
         layout.addWidget(self._trend_chart)
 
         layout.addWidget(_make_divider())
-        layout.addWidget(QLabel("Top Merchants"))
 
-        self._merchant_chart = SimpleBarChart()
+        # ── Top merchants bar chart ─────────────────────────────────────────
+        merch_title = QLabel("Top Merchants")
+        merch_title.setStyleSheet("font-size: 15px; font-weight: 600; color: #e5e7eb;")
+        layout.addWidget(merch_title)
+
+        self._merchant_chart = BarChartWidget(accent_color="#a78bfa", use_category_colors=False)
+        self._merchant_chart.setMinimumHeight(220)
         layout.addWidget(self._merchant_chart)
 
         self._status_label = _make_muted_label("")
@@ -1071,10 +1514,22 @@ class AnalyticsView(QWidget):
         if not isinstance(data, dict):
             return
 
-        total    = float(data.get("total_spend") or 0)
-        count    = int(data.get("receipt_count") or 0)
-        avg      = float(data.get("average_spend") or 0)
-        top_cat  = data.get("top_category") or "—"
+        total   = float(data.get("total_spend") or 0)
+        count   = int(data.get("receipt_count") or 0)
+        avg     = float(data.get("average_spend") or 0)
+        top_cat = data.get("top_category") or "—"
+
+        # ── BUG 3 FIX: show warning if receipts are still processing ─────────
+        pending_count = int(data.get("pending_count") or 0)
+        if pending_count > 0:
+            s = "s" if pending_count != 1 else ""
+            self._pending_banner.setText(
+                f"⏳  {pending_count} receipt{s} still processing — "
+                f"totals will update automatically once OCR finishes."
+            )
+            self._pending_banner.show()
+        else:
+            self._pending_banner.hide()
 
         currency = "LKR"
         self._kpi_total.set_value(f"{currency} {total:,.2f}")
@@ -1083,7 +1538,8 @@ class AnalyticsView(QWidget):
         self._kpi_top_cat.set_value(str(top_cat))
 
         breakdown = data.get("category_breakdown") or []
-        self._category_chart.set_data(breakdown, value_key="amount", label_key="category")
+        self._pie_chart.set_data(breakdown)
+        self._pie_legend.set_data(breakdown)
 
         trend = data.get("monthly_trend") or []
         self._trend_chart.set_data(trend, value_key="amount", label_key="period")
@@ -1136,7 +1592,7 @@ class InsightCard(QFrame):
         category = insight.get("category")
         if category:
             cat_label = QLabel(category)
-            cat_label.setStyleSheet("color: #6b7280; font-size: 11px; background: transparent;")
+            cat_label.setStyleSheet(f"color: {_category_color(category)}; font-size: 11px; background: transparent;")
             header.addWidget(cat_label)
 
         header.addStretch()
@@ -1432,7 +1888,6 @@ class AskView(QWidget):
         self._scroll_to_bottom()
 
     def _scroll_to_bottom(self) -> None:
-        from PySide6.QtCore import QTimer
         QTimer.singleShot(50, lambda: self._scroll.verticalScrollBar().setValue(
             self._scroll.verticalScrollBar().maximum()
         ))

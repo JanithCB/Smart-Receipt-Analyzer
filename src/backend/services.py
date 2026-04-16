@@ -1,13 +1,10 @@
-# src/backend/services.py
-
-import io
+import json
 import logging
 import os
 import re
-import shutil
 import uuid
-from collections import Counter
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +27,7 @@ ALLOWED_MIME_TYPES = {
 }
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE_MB", "15")) * 1024 * 1024
 DEFAULT_UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", "uploads"))
+MAX_REASONABLE_RECEIPT_AMOUNT = float(os.getenv("MAX_REASONABLE_RECEIPT_AMOUNT", "1000000"))
 
 CATEGORY_RULES: dict[str, dict[str, list[str]]] = {
     "Groceries": {
@@ -67,6 +65,70 @@ CATEGORY_RULES: dict[str, dict[str, list[str]]] = {
         "Uncategorized": [],
     },
 }
+
+TOTAL_LABEL_PATTERNS = [
+    r"grand\s*total",
+    r"total\s*amount",
+    r"total\s*payable",
+    r"amount\s*due",
+    r"amount\s*paid",
+    r"net\s*amount",
+    r"net\s*total",
+    r"balance\s*due",
+    r"sub[\s-]*total",
+    r"\bsubtotal\b",
+    r"\bpayable\b",
+    r"\bto\s*pay\b",
+    r"\bcash\b",
+    r"\btotal\b",
+]
+
+CURRENCY_PREFIX_PATTERN = r"(?:rs\.?|lkr|usd|eur|gbp|inr|\$|€|£|₹)?"
+AMOUNT_PATTERN = r"([0-9]{1,3}(?:[,\s][0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)"
+
+BAD_NUMBER_CONTEXT = [
+    "tel",
+    "phone",
+    "mobile",
+    "invoice",
+    "invoice no",
+    "receipt no",
+    "receipt#",
+    "ref",
+    "reference",
+    "vat",
+    "tin",
+    "tax id",
+    "card",
+    "approval",
+    "auth",
+    "trace",
+    "batch",
+]
+
+DATE_PATTERNS = [
+    r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b",
+    r"\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b",
+    r"\b(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})\b",
+    r"\b([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b",
+]
+
+DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%d/%m/%Y",
+    "%d-%m-%Y",
+    "%d/%m/%y",
+    "%d-%m-%y",
+    "%m/%d/%Y",
+    "%m-%d-%Y",
+    "%m/%d/%y",
+    "%m-%d-%y",
+    "%d %B %Y",
+    "%d %b %Y",
+    "%B %d, %Y",
+    "%b %d, %Y",
+)
 
 
 # -------------------------------------------------------------------
@@ -132,6 +194,17 @@ async def save_upload_file(file: UploadFile, uploads_dir: Path) -> tuple[Path, s
 # -------------------------------------------------------------------
 
 
+def _configure_tesseract() -> None:
+    try:
+        import pytesseract
+    except Exception:
+        return
+
+    tesseract_cmd = os.getenv("TESSERACT_CMD")
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+
 def extract_text_from_file(file_path: str | Path) -> str:
     path = Path(file_path)
     suffix = path.suffix.lower()
@@ -151,6 +224,7 @@ def extract_text_from_image(image_path: Path) -> str:
         return ""
 
     try:
+        _configure_tesseract()
         image = Image.open(image_path)
         text = pytesseract.image_to_string(image)
         return clean_ocr_text(text)
@@ -160,11 +234,6 @@ def extract_text_from_image(image_path: Path) -> str:
 
 
 def extract_text_from_pdf(pdf_path: Path) -> str:
-    """
-    PDF OCR fallback behavior:
-    - Try pdf2image + pytesseract if available.
-    - If dependencies are missing, return empty text rather than crashing.
-    """
     try:
         from pdf2image import convert_from_path
         import pytesseract
@@ -173,6 +242,7 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
         return ""
 
     try:
+        _configure_tesseract()
         pages = convert_from_path(str(pdf_path), dpi=200)
         texts: list[str] = []
         for page in pages[:5]:
@@ -245,65 +315,131 @@ def parse_currency(text: str) -> str | None:
     return None
 
 
+def _normalize_amount_string(raw: str) -> str | None:
+    if not raw:
+        return None
+    value = raw.strip().replace(",", "").replace(" ", "")
+    if value.count(".") > 1:
+        return None
+    if not re.fullmatch(r"\d+(?:\.\d{1,2})?", value):
+        return None
+    return value
+
+
+def _is_plausible_amount(value: Decimal) -> bool:
+    return Decimal("1") <= value <= Decimal(str(MAX_REASONABLE_RECEIPT_AMOUNT))
+
+
 def parse_total_amount(text: str) -> float | None:
-    patterns = [
-        r"(?:total|grand total|amount due|net total)\s*[:\-]?\s*(?:rs\.?|lkr|usd|eur|gbp|inr|\$|€|£|₹)?\s*([0-9]+(?:[,\s][0-9]{3})*(?:\.[0-9]{1,2})?)",
-        r"(?:balance due)\s*[:\-]?\s*(?:rs\.?|lkr|usd|eur|gbp|inr|\$|€|£|₹)?\s*([0-9]+(?:[,\s][0-9]{3})*(?:\.[0-9]{1,2})?)",
+    if not text:
+        return None
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    label_regexes = [
+        re.compile(
+            rf"{label}\s*[:\-]?\s*{CURRENCY_PREFIX_PATTERN}\s*{AMOUNT_PATTERN}",
+            re.IGNORECASE,
+        )
+        for label in TOTAL_LABEL_PATTERNS
     ]
 
-    candidates: list[float] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-            value = match.group(1).replace(",", "").replace(" ", "")
-            try:
-                candidates.append(float(value))
-            except ValueError:
-                continue
+    currency_priority_patterns = [
+        re.compile(rf"(?:rs\.?|lkr)\s*[:\-]?\s*{AMOUNT_PATTERN}", re.IGNORECASE),
+        re.compile(rf"(?:usd|\$|eur|€|gbp|£|inr|₹)\s*[:\-]?\s*{AMOUNT_PATTERN}", re.IGNORECASE),
+    ]
 
-    if candidates:
-        return max(candidates)
-
-    fallback = re.findall(r"([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{2})?)", text)
-    numeric_values: list[float] = []
-    for item in fallback:
-        try:
-            numeric_values.append(float(item.replace(",", "")))
-        except ValueError:
+    for line in lines:
+        line_lower = line.lower()
+        if any(bad in line_lower for bad in BAD_NUMBER_CONTEXT):
             continue
 
-    return max(numeric_values) if numeric_values else None
+        for pattern in label_regexes:
+            match = pattern.search(line)
+            if not match:
+                continue
+
+            normalized = _normalize_amount_string(match.group(1))
+            if not normalized:
+                continue
+
+            try:
+                amount = Decimal(normalized)
+            except InvalidOperation:
+                continue
+
+            if _is_plausible_amount(amount):
+                return float(amount)
+
+        for pattern in currency_priority_patterns:
+            match = pattern.search(line)
+            if not match:
+                continue
+
+            normalized = _normalize_amount_string(match.group(1))
+            if not normalized:
+                continue
+
+            try:
+                amount = Decimal(normalized)
+            except InvalidOperation:
+                continue
+
+            if _is_plausible_amount(amount):
+                return float(amount)
+
+    start_index = max(0, len(lines) // 2)
+    fallback_candidates: list[tuple[int, Decimal]] = []
+
+    for idx, line in enumerate(lines[start_index:], start=start_index):
+        line_lower = line.lower()
+        if any(bad in line_lower for bad in BAD_NUMBER_CONTEXT):
+            continue
+
+        for raw in re.findall(AMOUNT_PATTERN, line):
+            normalized = _normalize_amount_string(raw)
+            if not normalized:
+                continue
+
+            try:
+                amount = Decimal(normalized)
+            except InvalidOperation:
+                continue
+
+            if not _is_plausible_amount(amount):
+                continue
+
+            fallback_candidates.append((idx, amount))
+
+    if not fallback_candidates:
+        return None
+
+    fallback_candidates.sort(key=lambda item: (item[0], item[1]))
+    return float(fallback_candidates[-1][1])
 
 
 def parse_receipt_date(text: str) -> datetime | None:
-    date_patterns = [
-        r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})",
-        r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
-        r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4})",
-        r"([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})",
-    ]
+    if not text:
+        return None
 
-    for pattern in date_patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
+    current_year = datetime.now().year
 
-        raw = match.group(1).strip()
-        for fmt in (
-            "%Y-%m-%d",
-            "%Y/%m/%d",
-            "%d-%m-%Y",
-            "%d/%m/%Y",
-            "%d-%m-%y",
-            "%d/%m/%y",
-            "%d %B %Y",
-            "%d %b %Y",
-            "%B %d, %Y",
-            "%b %d, %Y",
-        ):
-            try:
-                return datetime.strptime(raw, fmt)
-            except ValueError:
-                continue
+    for pattern in DATE_PATTERNS:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        for raw in matches:
+            raw = raw.strip()
+            for fmt in DATE_FORMATS:
+                try:
+                    parsed = datetime.strptime(raw, fmt)
+                except ValueError:
+                    continue
+
+                if parsed.year < 2000 or parsed.year > current_year + 1:
+                    continue
+
+                return parsed
 
     return None
 
@@ -316,7 +452,7 @@ def parse_merchant(text: str, original_filename: str | None = None) -> str | Non
         lowered = line.lower()
         if len(line) < 3:
             continue
-        if any(keyword == lowered for keyword in ignored):
+        if lowered in ignored:
             continue
         if re.search(r"\d{2,}", line):
             continue
@@ -374,7 +510,7 @@ def categorize_by_rules(merchant: str | None, text: str) -> dict[str, Any]:
                     return {
                         "category": category,
                         "subcategory": subcategory,
-                        "confidence": 0.78,
+                        "confidence": 0.82,
                         "source": "rules",
                         "needs_review": False,
                     }
@@ -386,6 +522,26 @@ def categorize_by_rules(merchant: str | None, text: str) -> dict[str, Any]:
         "source": "rules",
         "needs_review": True,
     }
+
+
+def _parse_openai_category_response(content: str, valid_categories: list[str]) -> str | None:
+    if not content:
+        return None
+
+    try:
+        data = json.loads(content)
+        category = str(data.get("category", "")).strip()
+        if category in valid_categories:
+            return category
+    except Exception:
+        pass
+
+    lowered = content.lower()
+    for category in valid_categories:
+        if re.search(rf"\b{re.escape(category.lower())}\b", lowered):
+            return category
+
+    return None
 
 
 def categorize_with_openai(merchant: str | None, text: str) -> dict[str, Any] | None:
@@ -400,7 +556,6 @@ def categorize_with_openai(merchant: str | None, text: str) -> dict[str, Any] | 
         return None
 
     categories = list(CATEGORY_RULES.keys())
-
     prompt = (
         "Classify this receipt into one of these categories: "
         f"{', '.join(categories)}.\n"
@@ -420,7 +575,7 @@ def categorize_with_openai(merchant: str | None, text: str) -> dict[str, Any] | 
             temperature=0.1,
         )
         content = response.choices[0].message.content or ""
-        category = next((c for c in categories if c.lower() in content.lower()), "Other")
+        category = _parse_openai_category_response(content, categories) or "Other"
         return {
             "category": category,
             "subcategory": None,
@@ -444,7 +599,7 @@ def categorize_receipt(
         return feedback_result
 
     rule_result = categorize_by_rules(merchant, text)
-    if rule_result["confidence"] >= 0.75:
+    if rule_result["confidence"] >= 0.8:
         return rule_result
 
     ai_result = categorize_with_openai(merchant, text)
@@ -477,7 +632,7 @@ def process_receipt(receipt_id: int, db: Session) -> Receipt:
         working_text = translated_text or extracted_text
         merchant = parse_merchant(working_text, receipt.original_filename)
         total_amount = parse_total_amount(working_text)
-        currency = parse_currency(working_text)
+        currency = parse_currency(working_text) or "LKR"
         receipt_date = parse_receipt_date(working_text)
 
         category_result = categorize_receipt(
@@ -486,6 +641,11 @@ def process_receipt(receipt_id: int, db: Session) -> Receipt:
             merchant=merchant,
             text=working_text,
         )
+
+        if total_amount is not None and (total_amount <= 0 or total_amount > MAX_REASONABLE_RECEIPT_AMOUNT):
+            logger.warning("Rejecting implausible total_amount=%s for receipt id=%s", total_amount, receipt_id)
+            total_amount = None
+            category_result["needs_review"] = True
 
         receipt.ocr_text = extracted_text or None
         receipt.translated_text = translated_text if translated_text != extracted_text else None
@@ -498,12 +658,14 @@ def process_receipt(receipt_id: int, db: Session) -> Receipt:
         receipt.subcategory = category_result.get("subcategory")
         receipt.confidence = category_result.get("confidence")
         receipt.category_source = category_result.get("source")
-        receipt.needs_review = category_result.get("needs_review", False)
-        receipt.processing_status = "done"
+        receipt.needs_review = category_result.get("needs_review", False) or total_amount is None
+        receipt.processing_status = "done" if extracted_text else "failed"
+
     except Exception as exc:
         logger.exception("Receipt processing failed for id=%s: %s", receipt_id, exc)
         receipt.processing_status = "failed"
         receipt.needs_review = True
+
     finally:
         db.add(receipt)
         db.commit()

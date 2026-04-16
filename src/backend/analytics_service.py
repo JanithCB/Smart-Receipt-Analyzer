@@ -1,5 +1,3 @@
-# src/backend/analytics_service.py
-
 from collections import defaultdict
 from datetime import datetime, timedelta
 from statistics import mean, pstdev
@@ -9,8 +7,9 @@ from sqlalchemy.orm import Session
 
 from backend.models import Receipt
 
-
 VALID_PERIODS = {"week", "month", "year", "all"}
+PROCESSING_STATUSES_PENDING = {"uploaded", "processing", "pending"}
+MAX_REASONABLE_RECEIPT_AMOUNT = 1_000_000.0
 
 
 def _get_period_start(period: str) -> datetime | None:
@@ -34,6 +33,33 @@ def _base_receipts_query(db: Session, user_id: int):
     )
 
 
+def _pending_receipts_count(db: Session, user_id: int) -> int:
+    return (
+        db.query(Receipt)
+        .filter(
+            Receipt.user_id == user_id,
+            Receipt.processing_status.in_(tuple(PROCESSING_STATUSES_PENDING)),
+        )
+        .count()
+    )
+
+
+def _is_reasonable_amount(amount: float | None) -> bool:
+    if amount is None:
+        return False
+    return 0 < float(amount) <= MAX_REASONABLE_RECEIPT_AMOUNT
+
+
+def _clean_receipts(receipts: list[Receipt]) -> list[Receipt]:
+    cleaned: list[Receipt] = []
+    for receipt in receipts:
+        amount = float(receipt.total_amount) if receipt.total_amount is not None else None
+        if not _is_reasonable_amount(amount):
+            continue
+        cleaned.append(receipt)
+    return cleaned
+
+
 def _filter_receipts_by_period(receipts: list[Receipt], period: str) -> list[Receipt]:
     if (period or "month").lower() == "all":
         return receipts
@@ -43,15 +69,29 @@ def _filter_receipts_by_period(receipts: list[Receipt], period: str) -> list[Rec
         return receipts
 
     filtered: list[Receipt] = []
+    now = datetime.utcnow()
+
     for receipt in receipts:
-        reference_date = receipt.receipt_date or receipt.created_at
-        if reference_date and reference_date >= start:
+        receipt_date = receipt.receipt_date
+        created_at = receipt.created_at
+
+        reference_date = receipt_date or created_at
+        if reference_date is None:
+            continue
+
+        if reference_date >= start:
             filtered.append(receipt)
+            continue
+
+        if created_at and created_at >= start:
+            if receipt_date and receipt_date < start and receipt_date.year < now.year:
+                filtered.append(receipt)
+
     return filtered
 
 
 def detect_anomalies(receipts: list[Receipt]) -> list[dict[str, Any]]:
-    amounts = [float(r.total_amount) for r in receipts if r.total_amount is not None]
+    amounts = [float(r.total_amount) for r in receipts if r.total_amount is not None and _is_reasonable_amount(float(r.total_amount))]
     anomalies: list[dict[str, Any]] = []
 
     if len(amounts) < 3:
@@ -68,7 +108,11 @@ def detect_anomalies(receipts: list[Receipt]) -> list[dict[str, Any]]:
             continue
 
         amount = float(receipt.total_amount)
+        if not _is_reasonable_amount(amount):
+            continue
+
         if amount > avg + (2 * deviation):
+            reference_date = receipt.receipt_date or receipt.created_at
             anomalies.append(
                 {
                     "type": "high_spend",
@@ -78,11 +122,7 @@ def detect_anomalies(receipts: list[Receipt]) -> list[dict[str, Any]]:
                     ),
                     "category": receipt.category,
                     "amount": amount,
-                    "period": (
-                        (receipt.receipt_date or receipt.created_at).strftime("%Y-%m")
-                        if (receipt.receipt_date or receipt.created_at)
-                        else None
-                    ),
+                    "period": reference_date.strftime("%Y-%m") if reference_date else None,
                     "metadata": {
                         "receipt_id": receipt.id,
                         "average_amount": round(avg, 2),
@@ -95,12 +135,13 @@ def detect_anomalies(receipts: list[Receipt]) -> list[dict[str, Any]]:
 
 
 def get_recent_receipts(db: Session, user_id: int, limit: int = 10) -> list[Receipt]:
-    return (
+    receipts = (
         _base_receipts_query(db, user_id)
         .order_by(Receipt.created_at.desc())
-        .limit(limit)
         .all()
     )
+    receipts = _clean_receipts(receipts)
+    return receipts[:limit]
 
 
 def get_spending_summary(db: Session, user_id: int, period: str = "month") -> dict[str, Any]:
@@ -108,7 +149,10 @@ def get_spending_summary(db: Session, user_id: int, period: str = "month") -> di
     if normalized_period not in VALID_PERIODS:
         normalized_period = "month"
 
+    pending_count = _pending_receipts_count(db, user_id)
+
     receipts = _base_receipts_query(db, user_id).all()
+    receipts = _clean_receipts(receipts)
     receipts = _filter_receipts_by_period(receipts, normalized_period)
 
     if not receipts:
@@ -121,6 +165,7 @@ def get_spending_summary(db: Session, user_id: int, period: str = "month") -> di
             "monthly_trend": [],
             "top_merchants": [],
             "anomalies": [],
+            "pending_count": pending_count,
         }
 
     total_spend = round(sum(float(r.total_amount or 0) for r in receipts), 2)
@@ -198,4 +243,5 @@ def get_spending_summary(db: Session, user_id: int, period: str = "month") -> di
         "monthly_trend": monthly_trend,
         "top_merchants": top_merchants,
         "anomalies": anomalies,
+        "pending_count": pending_count,
     }
