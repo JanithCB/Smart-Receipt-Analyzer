@@ -6,35 +6,35 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from typing import Any
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-INDEX_DIR     = Path(os.getenv("RAG_INDEX_DIR",   "knowledge_base/vector_index"))
-INDEX_PATH    = INDEX_DIR / "faiss.index"
+INDEX_DIR = Path(os.getenv("RAG_INDEX_DIR", "knowledge_base/vector_index"))
+INDEX_PATH = INDEX_DIR / "faiss.index"
 METADATA_PATH = INDEX_DIR / "metadata.json"
-EMBED_MODEL   = os.getenv("RAG_EMBED_MODEL", "all-MiniLM-L6-v2")
+EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "all-MiniLM-L6-v2")
 DEFAULT_TOP_K = int(os.getenv("RAG_DEFAULT_TOP_K", "5"))
 
 
 class Retriever:
     def __init__(
         self,
-        index_path:    Path | str = INDEX_PATH,
+        index_path: Path | str = INDEX_PATH,
         metadata_path: Path | str = METADATA_PATH,
-        model_name:    str        = EMBED_MODEL,
+        model_name: str = EMBED_MODEL,
     ) -> None:
-        self._index_path    = Path(index_path)
+        self._index_path = Path(index_path)
         self._metadata_path = Path(metadata_path)
-        self._model_name    = model_name
+        self._model_name = model_name
 
-        self._model    = None
-        self._index    = None
+        self._model = None
+        self._index = None
         self._metadata: list[dict] = []
-        self._ready    = False
+        self._ready = False
 
     # ──────────────────────────────────────────────────────────
     # Lazy initialisation
@@ -82,7 +82,7 @@ class Retriever:
         try:
             self._index = faiss.read_index(str(self._index_path))
             logger.info(
-                "FAISS index loaded from %s  (%d vector(s))",
+                "FAISS index loaded from %s (%d vector(s))",
                 self._index_path,
                 self._index.ntotal,
             )
@@ -105,7 +105,7 @@ class Retriever:
 
             self._metadata = data
             logger.info(
-                "Metadata loaded from %s  (%d record(s))",
+                "Metadata loaded from %s (%d record(s))",
                 self._metadata_path,
                 len(self._metadata),
             )
@@ -176,7 +176,7 @@ class Retriever:
         Embed the query and return the top_k most similar knowledge chunks.
 
         Each result dict contains:
-            chunk_text, score, source, title, section, key_terms
+        chunk_text, score, source, title, section, key_terms
         """
         if not query or not query.strip():
             logger.warning("Empty query passed to Retriever.search — returning []")
@@ -212,18 +212,18 @@ class Retriever:
             results.append(
                 {
                     "chunk_text": record.get("chunk_text", ""),
-                    "score":      float(score),
-                    "source":     record.get("source"),
-                    "title":      record.get("title"),
-                    "section":    record.get("section"),
-                    "key_terms":  record.get("key_terms", []),
+                    "score": float(score),
+                    "source": record.get("source"),
+                    "title": record.get("title"),
+                    "section": record.get("section"),
+                    "key_terms": record.get("key_terms", []),
                     "chunk_index": record.get("chunk_index", 0),
-                    "id":         record.get("id"),
+                    "id": record.get("id"),
                 }
             )
 
         logger.debug(
-            "Search for %r returned %d result(s)  (top score: %.4f)",
+            "Search for %r returned %d result(s) (top score: %.4f)",
             query[:60],
             len(results),
             results[0]["score"] if results else 0.0,
@@ -252,17 +252,12 @@ class Retriever:
         )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI smoke test
-# ──────────────────────────────────────────────────────────────────────────────
-
-
 if __name__ == "__main__":
     import argparse
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        format="%(asctime)s %(levelname)-8s %(message)s",
         datefmt="%H:%M:%S",
     )
 
@@ -299,6 +294,6 @@ if __name__ == "__main__":
     else:
         print(f"\nQuery: {args.query}\n")
         for i, r in enumerate(results, start=1):
-            print(f"[{i}]  score={r['score']:.4f}  title={r['title']}  source={r['source']}")
-            print(f"     {r['chunk_text'][:200].strip()}")
+            print(f"[{i}] score={r['score']:.4f} title={r['title']} source={r['source']}")
+            print(f"  {r['chunk_text'][:200].strip()}")
             print()

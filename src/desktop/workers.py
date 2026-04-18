@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThread, Signal, Slot
 
 from desktop.api_client import APIError, api
 
@@ -13,15 +13,12 @@ logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Base signal carrier
-# QRunnable cannot inherit QObject directly, so signals live in a
-# separate QObject that the runnable holds a hard reference to.
 # ──────────────────────────────────────────────────────────────────────────────
-
 
 class WorkerSignals(QObject):
     finished = Signal()
-    error    = Signal(str)
-    result   = Signal(object)
+    error = Signal(str)
+    result = Signal(object)
     progress = Signal(int)
 
 
@@ -29,18 +26,9 @@ class WorkerSignals(QObject):
 # Generic API worker
 # ──────────────────────────────────────────────────────────────────────────────
 
-
 class ApiWorker(QRunnable):
     """
-    Run any callable off the UI thread.
-    The callable is called with no arguments; use functools.partial or a
-    lambda to capture arguments before passing the worker to the thread pool.
-
-    Example:
-        worker = ApiWorker(lambda: api.list_receipts(page=1))
-        worker.signals.result.connect(my_slot)
-        worker.signals.error.connect(error_slot)
-        QThreadPool.globalInstance().start(worker)
+    Run a callable off the UI thread.
     """
 
     def __init__(self, fn: Callable[[], Any]) -> None:
@@ -65,28 +53,19 @@ class ApiWorker(QRunnable):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Upload worker — one file at a time, emits progress per file
+# Upload worker
 # ──────────────────────────────────────────────────────────────────────────────
 
-
 class UploadWorkerSignals(QObject):
-    finished      = Signal()
-    error         = Signal(str, str)   # (filename, error_message)
-    file_done     = Signal(str, object)  # (filename, receipt_dict)
-    progress      = Signal(int, int)   # (completed_count, total_count)
+    finished = Signal()
+    error = Signal(str, str)          # filename, message
+    file_done = Signal(str, object)   # filename, receipt dict
+    progress = Signal(int, int)       # completed, total
 
 
 class UploadWorker(QRunnable):
     """
-    Upload a list of file paths sequentially, one at a time.
-    Emits per-file signals so the UI can update a progress list.
-
-    Example:
-        worker = UploadWorker(["/path/a.jpg", "/path/b.png"])
-        worker.signals.file_done.connect(on_file_done)
-        worker.signals.progress.connect(on_progress)
-        worker.signals.finished.connect(on_all_done)
-        QThreadPool.globalInstance().start(worker)
+    Upload files sequentially, one at a time.
     """
 
     def __init__(self, file_paths: list[str | Path]) -> None:
@@ -103,17 +82,14 @@ class UploadWorker(QRunnable):
         for file_path in self._file_paths:
             try:
                 receipt = api.upload_receipt(file_path)
-                completed += 1
                 self.signals.file_done.emit(file_path.name, receipt)
-                self.signals.progress.emit(completed, total)
             except APIError as exc:
                 logger.warning("Upload failed for %s: %s", file_path.name, exc)
                 self.signals.error.emit(file_path.name, str(exc))
-                completed += 1
-                self.signals.progress.emit(completed, total)
             except Exception as exc:
                 logger.exception("Unexpected upload error for %s: %s", file_path.name, exc)
                 self.signals.error.emit(file_path.name, f"Unexpected error: {exc}")
+            finally:
                 completed += 1
                 self.signals.progress.emit(completed, total)
 
@@ -121,24 +97,11 @@ class UploadWorker(QRunnable):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Health check worker — QThread based so it can be reused with a timer
+# Health check worker
 # ──────────────────────────────────────────────────────────────────────────────
 
-
 class HealthCheckWorker(QThread):
-    """
-    Poll the backend /health endpoint once.
-    Use QThread so the caller can hold a persistent reference and
-    re-trigger checks without recreating the object.
-
-    Example:
-        self._health = HealthCheckWorker()
-        self._health.healthy.connect(on_healthy)
-        self._health.unreachable.connect(on_unreachable)
-        self._health.start()
-    """
-
-    healthy     = Signal(dict)
+    healthy = Signal(dict)
     unreachable = Signal(str)
 
     def run(self) -> None:
@@ -153,10 +116,7 @@ class HealthCheckWorker(QThread):
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Convenience factory functions
-# Each returns a configured ApiWorker ready to pass to QThreadPool.
-# Caller must connect signals before submitting to the pool.
 # ──────────────────────────────────────────────────────────────────────────────
-
 
 def make_login_worker(email: str, password: str) -> ApiWorker:
     return ApiWorker(lambda: api.login(email, password))
@@ -252,9 +212,7 @@ def make_correct_category_worker(
     category: str,
     subcategory: str | None = None,
 ) -> ApiWorker:
-    return ApiWorker(
-        lambda: api.correct_category(receipt_id, category, subcategory)
-    )
+    return ApiWorker(lambda: api.correct_category(receipt_id, category, subcategory))
 
 
 def make_analytics_worker(period: str = "month") -> ApiWorker:
@@ -278,4 +236,31 @@ def make_auto_insights_worker(period: str = "month") -> ApiWorker:
 
 
 def make_ask_advisor_worker(question: str, period: str = "month") -> ApiWorker:
-    return ApiWorker(lambda: api.ask_advisor(question, period))
+    return ApiWorker(lambda: api.ask_advisor(question=question, period=period))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Backward-compatible aliases
+# views.py currently imports these names without underscores.
+# Keep both styles so we don't need to touch views.py right now.
+# ──────────────────────────────────────────────────────────────────────────────
+
+makeloginworker = make_login_worker
+makeregisterworker = make_register_worker
+makegetmeworker = make_get_me_worker
+makeupdatemeworker = make_update_me_worker
+
+makelistreceiptsworker = make_list_receipts_worker
+makegetreceiptworker = make_get_receipt_worker
+makeupdatereceiptworker = make_update_receipt_worker
+makedeletereceiptworker = make_delete_receipt_worker
+makereprocessreceiptworker = make_reprocess_receipt_worker
+makecorrectcategoryworker = make_correct_category_worker
+
+makeanalyticsworker = make_analytics_worker
+makesummaryworker = make_summary_worker
+makerecentreceiptsworker = make_recent_receipts_worker
+
+makeinsightsworker = make_insights_worker
+makeautoinsightsworker = make_auto_insights_worker
+makeaskadvisorworker = make_ask_advisor_worker

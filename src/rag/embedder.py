@@ -6,24 +6,23 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-CHUNKS_PATH   = Path(os.getenv("RAG_CHUNKS_PATH",    "knowledge_base/chunks/knowledge_chunks.json"))
-INDEX_DIR     = Path(os.getenv("RAG_INDEX_DIR",      "knowledge_base/vector_index"))
-INDEX_PATH    = INDEX_DIR / "faiss.index"
+CHUNKS_PATH = Path(os.getenv("RAG_CHUNKS_PATH", "knowledge_base/chunks/knowledge_chunks.json"))
+INDEX_DIR = Path(os.getenv("RAG_INDEX_DIR", "knowledge_base/vector_index"))
+INDEX_PATH = INDEX_DIR / "faiss.index"
 METADATA_PATH = INDEX_DIR / "metadata.json"
-EMBED_MODEL   = os.getenv("RAG_EMBED_MODEL", "all-MiniLM-L6-v2")
-BATCH_SIZE    = int(os.getenv("RAG_EMBED_BATCH_SIZE", "64"))
+EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "all-MiniLM-L6-v2")
+BATCH_SIZE = int(os.getenv("RAG_EMBED_BATCH_SIZE", "64"))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
 
 def load_chunks(chunks_path: Path) -> list[dict]:
     if not chunks_path.exists():
@@ -51,7 +50,7 @@ def load_model(model_name: str):
     except ImportError:
         raise ImportError(
             "sentence-transformers is required. Install it with:\n"
-            "  pip install sentence-transformers"
+            " pip install sentence-transformers"
         )
 
     logger.info("Loading embedding model: %s", model_name)
@@ -87,7 +86,7 @@ def build_faiss_index(embeddings: np.ndarray):
     except ImportError:
         raise ImportError(
             "faiss-cpu is required. Install it with:\n"
-            "  pip install faiss-cpu"
+            " pip install faiss-cpu"
         )
 
     dimension = embeddings.shape[1]
@@ -118,36 +117,35 @@ def save_metadata(chunks: list[dict], metadata_path: Path) -> None:
     for chunk in chunks:
         meta_records.append(
             {
-                "id":          chunk.get("id"),
-                "title":       chunk.get("title"),
-                "source":      chunk.get("source"),
-                "section":     chunk.get("section"),
-                "key_terms":   chunk.get("key_terms", []),
-                "chunk_text":  chunk.get("chunk_text", ""),
+                "id": chunk.get("id"),
+                "title": chunk.get("title"),
+                "source": chunk.get("source"),
+                "section": chunk.get("section"),
+                "key_terms": chunk.get("key_terms", []),
+                "chunk_text": chunk.get("chunk_text", ""),
                 "chunk_index": chunk.get("chunk_index", 0),
-                "file":        chunk.get("file"),
+                "file": chunk.get("file"),
             }
         )
 
     with metadata_path.open("w", encoding="utf-8") as fh:
         json.dump(meta_records, fh, ensure_ascii=False, indent=2)
 
-    logger.info("Metadata saved to %s  (%d record(s))", metadata_path, len(meta_records))
+    logger.info("Metadata saved to %s (%d record(s))", metadata_path, len(meta_records))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
-
 def run_embedder(
-    chunks_path:   Path = CHUNKS_PATH,
-    index_path:    Path = INDEX_PATH,
+    chunks_path: Path = CHUNKS_PATH,
+    index_path: Path = INDEX_PATH,
     metadata_path: Path = METADATA_PATH,
-    model_name:    str  = EMBED_MODEL,
+    model_name: str = EMBED_MODEL,
 ) -> None:
-    chunks_path   = Path(chunks_path)
-    index_path    = Path(index_path)
+    chunks_path = Path(chunks_path)
+    index_path = Path(index_path)
     metadata_path = Path(metadata_path)
 
     chunks = load_chunks(chunks_path)
@@ -160,30 +158,25 @@ def run_embedder(
     if empty:
         logger.warning("Skipping %d chunk(s) with empty text", len(empty))
         chunks = [c for i, c in enumerate(chunks) if i not in set(empty)]
-        texts  = [t for i, t in enumerate(texts)  if i not in set(empty)]
+        texts = [t for i, t in enumerate(texts) if i not in set(empty)]
 
     if not texts:
         logger.error("All chunks had empty text. Nothing to embed.")
         return
 
-    model      = load_model(model_name)
+    model = load_model(model_name)
     embeddings = embed_texts(model, texts)
-    index      = build_faiss_index(embeddings)
+    index = build_faiss_index(embeddings)
 
     save_index(index, index_path)
     save_metadata(chunks, metadata_path)
 
     logger.info(
-        "Embedder complete. %d vector(s) stored. Index: %s  Metadata: %s",
+        "Embedder complete. %d vector(s) stored. Index: %s Metadata: %s",
         index.ntotal,
         index_path,
         metadata_path,
     )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI entry point
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 if __name__ == "__main__":
@@ -191,7 +184,7 @@ if __name__ == "__main__":
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        format="%(asctime)s %(levelname)-8s %(message)s",
         datefmt="%H:%M:%S",
     )
 
@@ -216,7 +209,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    resolved_index    = Path(args.index_dir) / "faiss.index"
+    resolved_index = Path(args.index_dir) / "faiss.index"
     resolved_metadata = Path(args.index_dir) / "metadata.json"
 
     run_embedder(

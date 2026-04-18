@@ -1,8 +1,19 @@
+# src/backend/routers.py
+
+import logging
 import math
 from pathlib import Path
-from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
@@ -27,8 +38,19 @@ from backend.schemas import (
     UserUpdate,
 )
 from backend.security import create_access_token, hash_password, verify_password
+from rag.advisor import Advisor
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
+_advisor_instance: Advisor | None = None
+
+
+def _get_advisor() -> Advisor:
+    global _advisor_instance
+    if _advisor_instance is None:
+        _advisor_instance = Advisor()
+    return _advisor_instance
 
 
 def _get_user_by_email(db: Session, email: str) -> User | None:
@@ -46,20 +68,25 @@ def _get_owned_receipt_or_404(db: Session, user_id: int, receipt_id: int) -> Rec
         .first()
     )
     if not receipt:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Receipt not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Receipt not found",
+        )
     return receipt
 
 
 def _serialize_insights(items: list[dict]) -> list[InsightItem]:
     serialized: list[InsightItem] = []
     for idx, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
         serialized.append(
             InsightItem(
                 id=str(item.get("id") or f"insight-{idx}"),
-                type=item.get("type", "tip"),
-                title=item.get("title", "Insight"),
-                message=item.get("message", ""),
-                severity=item.get("severity", "info"),
+                type=str(item.get("type", "tip")),
+                title=str(item.get("title", "Insight")),
+                message=str(item.get("message", "")),
+                severity=str(item.get("severity", "info")),
                 category=item.get("category"),
                 amount=item.get("amount"),
                 metadata=item.get("metadata"),
@@ -72,17 +99,22 @@ def _serialize_insights(items: list[dict]) -> list[InsightItem]:
 # Auth endpoints
 # -------------------------------------------------------------------
 
-
 @router.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 def register(user_in: UserCreate, db: Session = Depends(get_db)) -> TokenResponse:
     email = user_in.email.lower().strip()
     username = user_in.username.strip()
 
     if _get_user_by_email(db, email):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email is already registered")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email is already registered",
+        )
 
     if _get_user_by_username(db, username):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username is already taken")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username is already taken",
+        )
 
     user = User(
         email=email,
@@ -96,20 +128,34 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)) -> TokenRespons
     db.refresh(user)
 
     token = create_access_token(subject=user.id)
-    return TokenResponse(access_token=token, token_type="bearer", user=UserOut.model_validate(user))
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        user=UserOut.model_validate(user),
+    )
 
 
 @router.post("/auth/login", response_model=TokenResponse)
 def login(payload: UserLogin, db: Session = Depends(get_db)) -> TokenResponse:
     user = _get_user_by_email(db, payload.email)
     if not user or not verify_password(payload.password, user.hashed_password):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
 
     if not user.is_active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is inactive")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is inactive",
+        )
 
     token = create_access_token(subject=user.id)
-    return TokenResponse(access_token=token, token_type="bearer", user=UserOut.model_validate(user))
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        user=UserOut.model_validate(user),
+    )
 
 
 @router.get("/auth/me", response_model=UserOut)
@@ -125,16 +171,28 @@ def update_me(
 ) -> UserOut:
     if payload.email is not None:
         email = payload.email.lower().strip()
-        existing = db.query(User).filter(User.email == email, User.id != current_user.id).first()
+        existing = db.query(User).filter(
+            User.email == email,
+            User.id != current_user.id,
+        ).first()
         if existing:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email is already in use")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email is already in use",
+            )
         current_user.email = email
 
     if payload.username is not None:
         username = payload.username.strip()
-        existing = db.query(User).filter(User.username == username, User.id != current_user.id).first()
+        existing = db.query(User).filter(
+            User.username == username,
+            User.id != current_user.id,
+        ).first()
         if existing:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username is already in use")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username is already in use",
+            )
         current_user.username = username
 
     if payload.full_name is not None:
@@ -152,7 +210,6 @@ def update_me(
 # -------------------------------------------------------------------
 # Receipt endpoints
 # -------------------------------------------------------------------
-
 
 @router.post("/receipts/upload", response_model=ReceiptOut, status_code=status.HTTP_201_CREATED)
 async def upload_receipt(
@@ -181,7 +238,6 @@ async def upload_receipt(
     db.refresh(receipt)
 
     background_tasks.add_task(services.process_receipt_background, receipt.id)
-    db.refresh(receipt)
 
     return ReceiptOut.model_validate(receipt)
 
@@ -190,10 +246,10 @@ async def upload_receipt(
 def list_receipts(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
-    category: Optional[str] = Query(default=None),
-    status_filter: Optional[str] = Query(default=None, alias="status"),
-    search: Optional[str] = Query(default=None),
-    needs_review: Optional[bool] = Query(default=None),
+    category: str | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    search: str | None = Query(default=None),
+    needs_review: bool | None = Query(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ReceiptListResponse:
@@ -282,8 +338,8 @@ def delete_receipt(
         file_path = Path(receipt.file_path)
         if file_path.exists():
             file_path.unlink(missing_ok=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Could not delete receipt file %s: %s", receipt.file_path, exc)
 
     db.delete(receipt)
     db.commit()
@@ -322,14 +378,14 @@ def correct_category(
         merchant=receipt.merchant or "unknown",
         merchant_normalized=services.normalize_merchant(receipt.merchant or ""),
         ai_predicted_category=receipt.category,
-        user_corrected_category=payload.corrected_category,
+        user_corrected_category=payload.category,
         ai_predicted_subcategory=receipt.subcategory,
-        user_corrected_subcategory=payload.corrected_subcategory,
+        user_corrected_subcategory=payload.subcategory,
     )
     db.add(feedback)
 
-    receipt.category = payload.corrected_category
-    receipt.subcategory = payload.corrected_subcategory
+    receipt.category = payload.category
+    receipt.subcategory = payload.subcategory
     receipt.category_source = "user_correction"
     receipt.needs_review = False
 
@@ -342,7 +398,6 @@ def correct_category(
 # -------------------------------------------------------------------
 # Analytics endpoints
 # -------------------------------------------------------------------
-
 
 @router.get("/analytics", response_model=AnalyticsSummaryResponse)
 def get_analytics(
@@ -378,7 +433,6 @@ def get_recent_receipts(
 # Advisor endpoints
 # -------------------------------------------------------------------
 
-
 @router.get("/advisor/insights", response_model=list[InsightItem])
 def get_insights(
     period: str = Query(default="month"),
@@ -397,7 +451,14 @@ def get_auto_insights(
     current_user: User = Depends(get_current_user),
 ) -> list[InsightItem]:
     summary = analytics_service.get_spending_summary(db, current_user.id, period=period)
-    insights = services.generate_auto_insights(summary)
+
+    try:
+        advisor = _get_advisor()
+        insights = advisor.auto_insights(summary)
+    except Exception as exc:
+        logger.exception("Advisor auto insights failed, using fallback: %s", exc)
+        insights = services.generate_auto_insights(summary)
+
     return _serialize_insights(insights)
 
 
@@ -409,9 +470,30 @@ def ask_advisor(
     current_user: User = Depends(get_current_user),
 ) -> AskAdvisorResponse:
     summary = analytics_service.get_spending_summary(db, current_user.id, period=period)
-    answer = services.answer_advisor_question(payload.question, summary)
+
+    try:
+        advisor = _get_advisor()
+        answer = advisor.advise(payload.question, summary)
+    except Exception as exc:
+        logger.exception("Advisor ask failed, using fallback: %s", exc)
+        answer = services.answer_advisor_question(payload.question, summary)
+
+    if isinstance(answer, str):
+        return AskAdvisorResponse(
+            answer=answer,
+            sources=[],
+            insights=[],
+        )
+
+    if not isinstance(answer, dict):
+        return AskAdvisorResponse(
+            answer="I could not generate a reliable answer right now.",
+            sources=[],
+            insights=[],
+        )
+
     return AskAdvisorResponse(
-        answer=answer.get("answer", ""),
-        sources=answer.get("sources", []),
+        answer=str(answer.get("answer", "")),
+        sources=answer.get("sources", []) if isinstance(answer.get("sources", []), list) else [],
         insights=_serialize_insights(answer.get("insights", [])),
     )

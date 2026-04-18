@@ -1,3 +1,5 @@
+# src/backend/main.py
+
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -5,8 +7,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load .env from project root before importing app modules that read env vars
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+# Load .env from src/.env before importing app modules that read env vars
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

@@ -1,3 +1,5 @@
+# src/backend/services.py
+
 import json
 import logging
 import os
@@ -25,9 +27,6 @@ ALLOWED_MIME_TYPES = {
     "image/tiff",
     "application/pdf",
 }
-MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE_MB", "15")) * 1024 * 1024
-DEFAULT_UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", "uploads"))
-MAX_REASONABLE_RECEIPT_AMOUNT = float(os.getenv("MAX_REASONABLE_RECEIPT_AMOUNT", "1000000"))
 
 CATEGORY_RULES: dict[str, dict[str, list[str]]] = {
     "Groceries": {
@@ -37,7 +36,7 @@ CATEGORY_RULES: dict[str, dict[str, list[str]]] = {
         "Restaurant": ["restaurant", "cafe", "coffee", "kfc", "mcdonald", "pizza", "burger", "bakery"],
     },
     "Transport": {
-        "Fuel": ["fuel", "petrol", "diesel", "ceypetco", "ioc", "shell"],
+        "Fuel": ["fuel", "petrol", "diesel", "ceypetco", "ioc", "shell", "petron"],
         "Ride": ["uber", "pickme", "taxi", "bus", "train"],
     },
     "Utilities": {
@@ -68,6 +67,8 @@ CATEGORY_RULES: dict[str, dict[str, list[str]]] = {
 
 TOTAL_LABEL_PATTERNS = [
     r"grand\s*total",
+    r"take[\s-]*out\s*total",
+    r"total\s*(?:rm|lkr|rs|usd|eur|gbp|inr)?\s*(?:incl(?:\.|usive)?\s*gst|inc(?:\.|usive)?\s*gst)?",
     r"total\s*amount",
     r"total\s*payable",
     r"amount\s*due",
@@ -83,7 +84,7 @@ TOTAL_LABEL_PATTERNS = [
     r"\btotal\b",
 ]
 
-CURRENCY_PREFIX_PATTERN = r"(?:rs\.?|lkr|usd|eur|gbp|inr|\$|€|£|₹)?"
+CURRENCY_PREFIX_PATTERN = r"(?:rs(?:\.|/)?|lkr|usd|eur|gbp|inr|rm|myr|\$|€|£|₹)?"
 AMOUNT_PATTERN = r"([0-9]{1,3}(?:[,\s][0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)"
 
 BAD_NUMBER_CONTEXT = [
@@ -131,14 +132,21 @@ DATE_FORMATS = (
 )
 
 
+def get_uploads_dir() -> Path:
+    return Path(os.getenv("UPLOADS_DIR", "uploads"))
+
+
+def get_max_upload_size() -> int:
+    return int(os.getenv("MAX_UPLOAD_SIZE_MB", "15")) * 1024 * 1024
+
+
+def get_max_reasonable_receipt_amount() -> float:
+    return float(os.getenv("MAX_REASONABLE_RECEIPT_AMOUNT", "1000000"))
+
+
 # -------------------------------------------------------------------
 # File and upload helpers
 # -------------------------------------------------------------------
-
-
-def get_uploads_dir() -> Path:
-    return DEFAULT_UPLOADS_DIR
-
 
 def validate_upload(file: UploadFile) -> None:
     filename = file.filename or ""
@@ -166,33 +174,40 @@ async def save_upload_file(file: UploadFile, uploads_dir: Path) -> tuple[Path, s
     safe_name = f"{uuid.uuid4().hex}{suffix}"
     destination = uploads_dir / safe_name
 
+    max_upload_size = get_max_upload_size()
     size = 0
-    with destination.open("wb") as buffer:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > MAX_UPLOAD_SIZE:
-                buffer.close()
-                try:
-                    destination.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"File too large. Maximum allowed size is {MAX_UPLOAD_SIZE // (1024 * 1024)} MB.",
-                )
-            buffer.write(chunk)
 
-    await file.close()
-    return destination, file.content_type
+    try:
+        with destination.open("wb") as buffer:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+
+                size += len(chunk)
+                if size > max_upload_size:
+                    try:
+                        destination.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"File too large. Maximum allowed size is {max_upload_size // (1024 * 1024)} MB.",
+                    )
+
+                buffer.write(chunk)
+
+        return destination, file.content_type
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
 
 
 # -------------------------------------------------------------------
 # OCR helpers
 # -------------------------------------------------------------------
-
 
 def _configure_tesseract() -> None:
     try:
@@ -217,7 +232,7 @@ def extract_text_from_file(file_path: str | Path) -> str:
 
 def extract_text_from_image(image_path: Path) -> str:
     try:
-        from PIL import Image
+        from PIL import Image, ImageFilter, ImageOps
         import pytesseract
     except Exception as exc:
         logger.warning("Image OCR dependencies unavailable: %s", exc)
@@ -226,7 +241,17 @@ def extract_text_from_image(image_path: Path) -> str:
     try:
         _configure_tesseract()
         image = Image.open(image_path)
-        text = pytesseract.image_to_string(image)
+        image = ImageOps.exif_transpose(image)
+        if image.mode not in ("L", "RGB"):
+            image = image.convert("RGB")
+
+        grayscale = ImageOps.grayscale(image)
+        processed = grayscale.filter(ImageFilter.SHARPEN)
+        text = pytesseract.image_to_string(processed, config="--psm 6")
+
+        if not text.strip():
+            text = pytesseract.image_to_string(image, config="--psm 6")
+
         return clean_ocr_text(text)
     except Exception as exc:
         logger.exception("Failed OCR on image %s: %s", image_path, exc)
@@ -243,10 +268,10 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
 
     try:
         _configure_tesseract()
-        pages = convert_from_path(str(pdf_path), dpi=200)
+        pages = convert_from_path(str(pdf_path), dpi=180, first_page=1, last_page=3)
         texts: list[str] = []
-        for page in pages[:5]:
-            texts.append(pytesseract.image_to_string(page))
+        for page in pages:
+            texts.append(pytesseract.image_to_string(page, config="--psm 6"))
         return clean_ocr_text("\n".join(texts))
     except Exception as exc:
         logger.exception("Failed OCR on PDF %s: %s", pdf_path, exc)
@@ -257,77 +282,119 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
 # Text parsing helpers
 # -------------------------------------------------------------------
 
-
 def clean_ocr_text(text: str) -> str:
-    text = text.replace("\x0c", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    if not text:
+        return ""
+
+    cleaned = text.replace("\x0c", " ")
+    cleaned = cleaned.replace("\r", "\n")
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
-def detect_language(text: str) -> str | None:
-    if not text.strip():
+def normalize_merchant(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    normalized = re.sub(r"[^a-z0-9\s&]", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def parse_json_blob(text: str) -> dict[str, Any] | None:
+    if not text:
         return None
 
     try:
-        from langdetect import detect
-        return detect(text)
+        return json.loads(text)
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        return json.loads(match.group(0))
     except Exception:
         return None
 
 
-def translate_to_english(text: str, source_language: str | None) -> str:
-    if not text.strip():
-        return text
+def parse_date(text: str) -> datetime | None:
+    if not text:
+        return None
 
-    if not source_language or source_language == "en":
-        return text
+    for pattern in DATE_PATTERNS:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            raw = match.group(1).strip()
+            for fmt in DATE_FORMATS:
+                try:
+                    return datetime.strptime(raw, fmt)
+                except ValueError:
+                    continue
 
-    try:
-        from deep_translator import GoogleTranslator
-        translated = GoogleTranslator(source=source_language, target="en").translate(text)
-        return translated or text
-    except Exception:
-        return text
-
-
-def normalize_merchant(merchant: str) -> str:
-    merchant = merchant.lower().strip()
-    merchant = re.sub(r"[^a-z0-9\s]", "", merchant)
-    merchant = re.sub(r"\s+", " ", merchant)
-    return merchant
-
-
-def parse_currency(text: str) -> str | None:
-    currency_patterns = {
-        "LKR": [r"\brs\.?\b", r"\blkr\b", r"රු"],
-        "USD": [r"\busd\b", r"\$\s?\d"],
-        "EUR": [r"\beur\b", r"€"],
-        "GBP": [r"\bgbp\b", r"£"],
-        "INR": [r"\binr\b", r"₹"],
-    }
-
-    lowered = text.lower()
-    for code, patterns in currency_patterns.items():
-        for pattern in patterns:
-            if re.search(pattern, lowered, flags=re.IGNORECASE):
-                return code
     return None
 
 
-def _normalize_amount_string(raw: str) -> str | None:
+def _number_has_bad_context(line: str, match_start: int) -> bool:
+    prefix = line[max(0, match_start - 24):match_start].lower()
+    return any(token in prefix for token in BAD_NUMBER_CONTEXT)
+
+
+def _normalize_amount_str(raw: str) -> str | None:
     if not raw:
         return None
-    value = raw.strip().replace(",", "").replace(" ", "")
+
+    value = raw.replace(" ", "").replace(",", "")
     if value.count(".") > 1:
         return None
-    if not re.fullmatch(r"\d+(?:\.\d{1,2})?", value):
+
+    try:
+        normalized = Decimal(value)
+    except (InvalidOperation, ValueError):
         return None
-    return value
+
+    if normalized <= 0:
+        return None
+
+    return str(normalized)
 
 
-def _is_plausible_amount(value: Decimal) -> bool:
-    return Decimal("1") <= value <= Decimal(str(MAX_REASONABLE_RECEIPT_AMOUNT))
+def _parse_decimal_amount(raw: str) -> float | None:
+    normalized = _normalize_amount_str(raw)
+    if normalized is None:
+        return None
+
+    try:
+        amount = float(Decimal(normalized))
+    except (InvalidOperation, ValueError):
+        return None
+
+    if amount <= 0:
+        return None
+
+    max_reasonable_amount = get_max_reasonable_receipt_amount()
+    if amount > max_reasonable_amount:
+        return None
+
+    return round(amount, 2)
+
+
+def _extract_amount_candidates(line: str) -> list[float]:
+    candidates: list[float] = []
+
+    for match in re.finditer(
+        rf"{CURRENCY_PREFIX_PATTERN}\s*{AMOUNT_PATTERN}",
+        line,
+        flags=re.IGNORECASE,
+    ):
+        if _number_has_bad_context(line, match.start(1)):
+            continue
+
+        amount = _parse_decimal_amount(match.group(1))
+        if amount is not None:
+            candidates.append(amount)
+
+    return candidates
 
 
 def parse_total_amount(text: str) -> float | None:
@@ -335,385 +402,203 @@ def parse_total_amount(text: str) -> float | None:
         return None
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return None
 
-    label_regexes = [
-        re.compile(
-            rf"{label}\s*[:\-]?\s*{CURRENCY_PREFIX_PATTERN}\s*{AMOUNT_PATTERN}",
-            re.IGNORECASE,
-        )
-        for label in TOTAL_LABEL_PATTERNS
-    ]
-
-    currency_priority_patterns = [
-        re.compile(rf"(?:rs\.?|lkr)\s*[:\-]?\s*{AMOUNT_PATTERN}", re.IGNORECASE),
-        re.compile(rf"(?:usd|\$|eur|€|gbp|£|inr|₹)\s*[:\-]?\s*{AMOUNT_PATTERN}", re.IGNORECASE),
-    ]
+    scored_candidates: list[tuple[int, float]] = []
 
     for line in lines:
-        line_lower = line.lower()
-        if any(bad in line_lower for bad in BAD_NUMBER_CONTEXT):
+        lower = line.lower()
+
+        for label in TOTAL_LABEL_PATTERNS:
+            if re.search(label, lower, flags=re.IGNORECASE):
+                for amount in _extract_amount_candidates(line):
+                    score = 100
+                    if "grand total" in lower:
+                        score += 20
+                    if "takeout total" in lower or "take out total" in lower:
+                        score += 15
+                    if "subtotal" in lower or "sub total" in lower:
+                        score -= 20
+                    scored_candidates.append((score, amount))
+
+    if scored_candidates:
+        scored_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return scored_candidates[0][1]
+
+    fallback_candidates: list[float] = []
+    for line in lines:
+        lower = line.lower()
+        if any(token in lower for token in BAD_NUMBER_CONTEXT):
             continue
-
-        for pattern in label_regexes:
-            match = pattern.search(line)
-            if not match:
-                continue
-
-            normalized = _normalize_amount_string(match.group(1))
-            if not normalized:
-                continue
-
-            try:
-                amount = Decimal(normalized)
-            except InvalidOperation:
-                continue
-
-            if _is_plausible_amount(amount):
-                return float(amount)
-
-        for pattern in currency_priority_patterns:
-            match = pattern.search(line)
-            if not match:
-                continue
-
-            normalized = _normalize_amount_string(match.group(1))
-            if not normalized:
-                continue
-
-            try:
-                amount = Decimal(normalized)
-            except InvalidOperation:
-                continue
-
-            if _is_plausible_amount(amount):
-                return float(amount)
-
-    start_index = max(0, len(lines) // 2)
-    fallback_candidates: list[tuple[int, Decimal]] = []
-
-    for idx, line in enumerate(lines[start_index:], start=start_index):
-        line_lower = line.lower()
-        if any(bad in line_lower for bad in BAD_NUMBER_CONTEXT):
-            continue
-
-        for raw in re.findall(AMOUNT_PATTERN, line):
-            normalized = _normalize_amount_string(raw)
-            if not normalized:
-                continue
-
-            try:
-                amount = Decimal(normalized)
-            except InvalidOperation:
-                continue
-
-            if not _is_plausible_amount(amount):
-                continue
-
-            fallback_candidates.append((idx, amount))
+        fallback_candidates.extend(_extract_amount_candidates(line))
 
     if not fallback_candidates:
         return None
 
-    fallback_candidates.sort(key=lambda item: (item[0], item[1]))
-    return float(fallback_candidates[-1][1])
+    return max(fallback_candidates)
 
 
-def parse_receipt_date(text: str) -> datetime | None:
+def parse_merchant(text: str) -> str | None:
     if not text:
         return None
 
-    current_year = datetime.now().year
-
-    for pattern in DATE_PATTERNS:
-        matches = re.findall(pattern, text, flags=re.IGNORECASE)
-        for raw in matches:
-            raw = raw.strip()
-            for fmt in DATE_FORMATS:
-                try:
-                    parsed = datetime.strptime(raw, fmt)
-                except ValueError:
-                    continue
-
-                if parsed.year < 2000 or parsed.year > current_year + 1:
-                    continue
-
-                return parsed
-
-    return None
-
-
-def parse_merchant(text: str, original_filename: str | None = None) -> str | None:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    ignored = {"invoice", "receipt", "tax invoice", "bill", "total", "amount", "cash"}
+    if not lines:
+        return None
+
+    ignored_prefixes = (
+        "invoice",
+        "receipt",
+        "tax",
+        "vat",
+        "tel",
+        "phone",
+        "date",
+        "time",
+        "table",
+        "cashier",
+    )
 
     for line in lines[:8]:
         lowered = line.lower()
-        if len(line) < 3:
+        if any(lowered.startswith(prefix) for prefix in ignored_prefixes):
             continue
-        if lowered in ignored:
+        if re.search(r"\d{3,}", line):
             continue
-        if re.search(r"\d{2,}", line):
+        if len(line) < 2:
             continue
-        return line[:255]
+        return line[:120]
 
-    if original_filename:
-        return Path(original_filename).stem.replace("_", " ").replace("-", " ").strip()[:255] or None
-
-    return None
+    return lines[0][:120] if lines else None
 
 
-# -------------------------------------------------------------------
-# Categorization helpers
-# -------------------------------------------------------------------
-
-
-def get_category_from_feedback(db: Session, user_id: int, merchant: str | None) -> dict[str, Any] | None:
+def apply_category_feedback(db: Session, merchant: str | None) -> tuple[str | None, str | None]:
     if not merchant:
-        return None
+        return None, None
 
     normalized = normalize_merchant(merchant)
     if not normalized:
-        return None
+        return None, None
 
-    feedback_rows = (
+    latest_feedback = (
         db.query(CategoryFeedback)
-        .filter(
-            CategoryFeedback.user_id == user_id,
-            CategoryFeedback.merchant_normalized == normalized,
-        )
+        .filter(CategoryFeedback.merchant_normalized == normalized)
         .order_by(CategoryFeedback.created_at.desc())
-        .all()
+        .first()
     )
 
-    if not feedback_rows:
-        return None
+    if not latest_feedback:
+        return None, None
 
-    latest = feedback_rows[0]
-    return {
-        "category": latest.user_corrected_category,
-        "subcategory": latest.user_corrected_subcategory,
-        "confidence": 0.98,
-        "source": "feedback",
-        "needs_review": False,
-    }
+    return latest_feedback.user_corrected_category, latest_feedback.user_corrected_subcategory
 
 
-def categorize_by_rules(merchant: str | None, text: str) -> dict[str, Any]:
-    combined = f"{merchant or ''} {text}".lower()
+def categorize_receipt(merchant: str | None, text: str | None = None) -> tuple[str, str]:
+    merchant_norm = normalize_merchant(merchant or "")
+    text_norm = (text or "").lower()
 
-    for category, sub_map in CATEGORY_RULES.items():
-        for subcategory, keywords in sub_map.items():
-            for keyword in keywords:
-                if keyword in combined:
-                    return {
-                        "category": category,
-                        "subcategory": subcategory,
-                        "confidence": 0.82,
-                        "source": "rules",
-                        "needs_review": False,
-                    }
+    for category, subcats in CATEGORY_RULES.items():
+        for subcategory, keywords in subcats.items():
+            if any(keyword in merchant_norm or keyword in text_norm for keyword in keywords):
+                return category, subcategory
 
-    return {
-        "category": "Other",
-        "subcategory": "Uncategorized",
-        "confidence": 0.35,
-        "source": "rules",
-        "needs_review": True,
-    }
-
-
-def _parse_openai_category_response(content: str, valid_categories: list[str]) -> str | None:
-    if not content:
-        return None
-
-    try:
-        data = json.loads(content)
-        category = str(data.get("category", "")).strip()
-        if category in valid_categories:
-            return category
-    except Exception:
-        pass
-
-    lowered = content.lower()
-    for category in valid_categories:
-        if re.search(rf"\b{re.escape(category.lower())}\b", lowered):
-            return category
-
-    return None
-
-
-def categorize_with_openai(merchant: str | None, text: str) -> dict[str, Any] | None:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return None
-
-    try:
-        from openai import OpenAI
-    except Exception as exc:
-        logger.warning("OpenAI SDK unavailable: %s", exc)
-        return None
-
-    categories = list(CATEGORY_RULES.keys())
-    prompt = (
-        "Classify this receipt into one of these categories: "
-        f"{', '.join(categories)}.\n"
-        "Return strict JSON with keys: category, subcategory, confidence.\n"
-        f"Merchant: {merchant or 'Unknown'}\n"
-        f"Text: {text[:2500]}"
-    )
-
-    try:
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=[
-                {"role": "system", "content": "You classify receipt spending categories."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-        )
-        content = response.choices[0].message.content or ""
-        category = _parse_openai_category_response(content, categories) or "Other"
-        return {
-            "category": category,
-            "subcategory": None,
-            "confidence": 0.7,
-            "source": "openai",
-            "needs_review": category == "Other",
-        }
-    except Exception as exc:
-        logger.warning("OpenAI categorization failed: %s", exc)
-        return None
-
-
-def categorize_receipt(
-    db: Session,
-    user_id: int,
-    merchant: str | None,
-    text: str,
-) -> dict[str, Any]:
-    feedback_result = get_category_from_feedback(db, user_id, merchant)
-    if feedback_result:
-        return feedback_result
-
-    rule_result = categorize_by_rules(merchant, text)
-    if rule_result["confidence"] >= 0.8:
-        return rule_result
-
-    ai_result = categorize_with_openai(merchant, text)
-    if ai_result:
-        return ai_result
-
-    return rule_result
+    return "Other", "Uncategorized"
 
 
 # -------------------------------------------------------------------
-# Receipt processing orchestration
+# Background receipt processing
 # -------------------------------------------------------------------
 
-
-def process_receipt(receipt_id: int, db: Session) -> Receipt:
-    receipt = db.query(Receipt).filter(Receipt.id == receipt_id).first()
-    if not receipt:
-        raise ValueError(f"Receipt {receipt_id} not found")
+def process_receipt_background(receipt_id: int) -> None:
+    db = SessionLocal()
 
     try:
+        receipt = db.query(Receipt).filter(Receipt.id == receipt_id).first()
+        if not receipt:
+            logger.warning("Receipt %s not found for background processing", receipt_id)
+            return
+
         receipt.processing_status = "processing"
         db.add(receipt)
         db.commit()
         db.refresh(receipt)
 
         extracted_text = extract_text_from_file(receipt.file_path)
-        language = detect_language(extracted_text)
-        translated_text = translate_to_english(extracted_text, language)
+        merchant = parse_merchant(extracted_text)
+        total_amount = parse_total_amount(extracted_text)
+        receipt_date = parse_date(extracted_text)
 
-        working_text = translated_text or extracted_text
-        merchant = parse_merchant(working_text, receipt.original_filename)
-        total_amount = parse_total_amount(working_text)
-        currency = parse_currency(working_text) or "LKR"
-        receipt_date = parse_receipt_date(working_text)
+        category = None
+        subcategory = None
+        category_source = "rule_based"
 
-        category_result = categorize_receipt(
-            db=db,
-            user_id=receipt.user_id,
-            merchant=merchant,
-            text=working_text,
-        )
-
-        if total_amount is not None and (total_amount <= 0 or total_amount > MAX_REASONABLE_RECEIPT_AMOUNT):
-            logger.warning("Rejecting implausible total_amount=%s for receipt id=%s", total_amount, receipt_id)
-            total_amount = None
-            category_result["needs_review"] = True
+        corrected_category, corrected_subcategory = apply_category_feedback(db, merchant)
+        if corrected_category:
+            category = corrected_category
+            subcategory = corrected_subcategory
+            category_source = "user_correction"
+        else:
+            category, subcategory = categorize_receipt(merchant, extracted_text)
 
         receipt.ocr_text = extracted_text or None
-        receipt.translated_text = translated_text if translated_text != extracted_text else None
-        receipt.language = language
         receipt.merchant = merchant
         receipt.total_amount = total_amount
-        receipt.currency = currency
         receipt.receipt_date = receipt_date
-        receipt.category = category_result["category"]
-        receipt.subcategory = category_result.get("subcategory")
-        receipt.confidence = category_result.get("confidence")
-        receipt.category_source = category_result.get("source")
-        receipt.needs_review = category_result.get("needs_review", False) or total_amount is None
-        receipt.processing_status = "done" if extracted_text else "failed"
+        receipt.category = category
+        receipt.subcategory = subcategory
+        receipt.category_source = category_source
+        receipt.currency = receipt.currency or "LKR"
 
-    except Exception as exc:
-        logger.exception("Receipt processing failed for id=%s: %s", receipt_id, exc)
-        receipt.processing_status = "failed"
-        receipt.needs_review = True
+        has_meaningful_result = any(
+            [
+                bool(extracted_text and extracted_text.strip()),
+                merchant is not None,
+                total_amount is not None,
+                receipt_date is not None,
+            ]
+        )
 
-    finally:
+        receipt.needs_review = total_amount is None
+
+        if total_amount is not None:
+            receipt.processing_status = "done"
+        elif has_meaningful_result:
+            receipt.processing_status = "failed"
+        else:
+            receipt.processing_status = "failed"
+
         db.add(receipt)
         db.commit()
         db.refresh(receipt)
 
-    return receipt
+        logger.info(
+            "Processed receipt %s | status=%s merchant=%s amount=%s date=%s category=%s",
+            receipt.id,
+            receipt.processing_status,
+            receipt.merchant,
+            receipt.total_amount,
+            receipt.receipt_date,
+            receipt.category,
+        )
 
-
-def process_receipt_background(receipt_id: int) -> None:
-    db = SessionLocal()
-    try:
-        process_receipt(receipt_id, db)
     except Exception as exc:
-        logger.exception("Background receipt processing failed for id=%s: %s", receipt_id, exc)
+        logger.exception("Receipt processing failed for %s: %s", receipt_id, exc)
+        try:
+            db.rollback()
+            receipt = db.query(Receipt).filter(Receipt.id == receipt_id).first()
+            if receipt:
+                receipt.processing_status = "failed"
+                receipt.needs_review = True
+                db.add(receipt)
+                db.commit()
+        except Exception:
+            logger.exception("Failed to mark receipt %s as failed after exception", receipt_id)
     finally:
         db.close()
 
 
-def save_category_feedback(
-    db: Session,
-    user_id: int,
-    receipt_id: int | None,
-    merchant: str,
-    ai_predicted_category: str | None,
-    user_corrected_category: str,
-    ai_predicted_subcategory: str | None = None,
-    user_corrected_subcategory: str | None = None,
-) -> CategoryFeedback:
-    feedback = CategoryFeedback(
-        user_id=user_id,
-        receipt_id=receipt_id,
-        merchant=merchant,
-        merchant_normalized=normalize_merchant(merchant),
-        ai_predicted_category=ai_predicted_category,
-        user_corrected_category=user_corrected_category,
-        ai_predicted_subcategory=ai_predicted_subcategory,
-        user_corrected_subcategory=user_corrected_subcategory,
-    )
-    db.add(feedback)
-    db.commit()
-    db.refresh(feedback)
-    return feedback
-
-
 # -------------------------------------------------------------------
-# Advisor fallback logic
+# Insights and advisor helpers
 # -------------------------------------------------------------------
-
 
 def generate_insights(summary: dict[str, Any]) -> list[dict[str, Any]]:
     insights: list[dict[str, Any]] = []
@@ -865,7 +750,6 @@ def answer_advisor_question(question: str, summary: dict[str, Any]) -> dict[str,
 # -------------------------------------------------------------------
 # Shared utility helpers
 # -------------------------------------------------------------------
-
 
 def safe_float(value: Any) -> float | None:
     try:

@@ -106,7 +106,7 @@ class ReceiptOut(BaseModel):
     language: str | None = None
     created_at: datetime
     updated_at: datetime
-    line_items: list[LineItemOut] = []
+    line_items: list[LineItemOut] = Field(default_factory=list)
 
 
 class PaginationMeta(BaseModel):
@@ -149,8 +149,8 @@ class BudgetOut(BudgetBase):
 
 
 class CategoryCorrectionRequest(BaseModel):
-    corrected_category: str = Field(min_length=1, max_length=100)
-    corrected_subcategory: str | None = Field(default=None, max_length=100)
+    category: str = Field(min_length=1, max_length=100)
+    subcategory: str | None = Field(default=None, max_length=100)
 
 
 class CategoryBreakdownItem(BaseModel):
@@ -198,11 +198,13 @@ class AnalyticsSummaryResponse(BaseModel):
     total_spend: float
     receipt_count: int
     average_spend: float
+    pending_count: int = 0
+    currency: str = "LKR"
     top_category: str | None = None
-    category_breakdown: list[CategoryBreakdownItem] = []
-    monthly_trend: list[MonthlyTrendItem] = []
-    top_merchants: list[TopMerchantItem] = []
-    anomalies: list[AnomalyItem] = []
+    category_breakdown: list[CategoryBreakdownItem] = Field(default_factory=list)
+    monthly_trend: list[MonthlyTrendItem] = Field(default_factory=list)
+    top_merchants: list[TopMerchantItem] = Field(default_factory=list)
+    anomalies: list[AnomalyItem] = Field(default_factory=list)
 
 
 class InsightItem(BaseModel):
@@ -222,5 +224,5 @@ class AskAdvisorRequest(BaseModel):
 
 class AskAdvisorResponse(BaseModel):
     answer: str
-    sources: list[str] = []
-    insights: list[InsightItem] = []
+    sources: list[str] = Field(default_factory=list)
+    insights: list[InsightItem] = Field(default_factory=list)

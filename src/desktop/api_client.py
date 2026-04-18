@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_TIMEOUT = int(os.getenv("API_TIMEOUT_SECONDS", "30"))
-UPLOAD_TIMEOUT = int(os.getenv("API_UPLOAD_TIMEOUT_SECONDS", "120"))
+UPLOAD_TIMEOUT = int(os.getenv("API_UPLOAD_TIMEOUT_SECONDS", "180"))
+PROCESSING_TIMEOUT = int(os.getenv("API_PROCESSING_TIMEOUT_SECONDS", "180"))
 
 
 class APIError(Exception):
@@ -21,9 +22,9 @@ class APIError(Exception):
         self.status_code = status_code
 
     def __str__(self) -> str:
-        if self.status_code:
+        if self.status_code is not None:
             return f"[{self.status_code}] {super().__str__()}"
-        return super().__str__()
+        return str(super().__str__())
 
 
 class APIClient:
@@ -68,20 +69,33 @@ class APIClient:
         if not detail:
             detail = response.text[:300] if response.text else response.reason
 
+        if response.status_code == 401:
+            self.clear_token()
+
         raise APIError(
             message=detail or "An unexpected error occurred.",
             status_code=response.status_code,
         )
 
-    def _get(self, path: str, params: dict | None = None, timeout: int = DEFAULT_TIMEOUT) -> Any:
+    def _handle_request_exception(self, exc: Exception) -> None:
+        if isinstance(exc, requests.exceptions.ConnectionError):
+            raise APIError("Cannot connect to the backend. Make sure the server is running.")
+        if isinstance(exc, requests.exceptions.Timeout):
+            raise APIError("Request timed out. The server took too long to respond.")
+        if isinstance(exc, requests.exceptions.RequestException):
+            raise APIError(f"Request failed: {exc}")
+        raise APIError(f"Unexpected request error: {exc}")
+
+    def _get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        timeout: int = DEFAULT_TIMEOUT,
+    ) -> Any:
         try:
             response = self._session.get(self._url(path), params=params, timeout=timeout)
-        except requests.exceptions.ConnectionError:
-            raise APIError("Cannot connect to the backend. Make sure the server is running.")
-        except requests.exceptions.Timeout:
-            raise APIError("Request timed out. The server took too long to respond.")
-        except requests.exceptions.RequestException as exc:
-            raise APIError(f"Request failed: {exc}")
+        except Exception as exc:
+            self._handle_request_exception(exc)
         return self._parse_response(response)
 
     def _post(
@@ -90,6 +104,7 @@ class APIClient:
         json: Any = None,
         data: Any = None,
         files: Any = None,
+        params: dict[str, Any] | None = None,
         timeout: int = DEFAULT_TIMEOUT,
     ) -> Any:
         try:
@@ -98,36 +113,30 @@ class APIClient:
                 json=json,
                 data=data,
                 files=files,
+                params=params,
                 timeout=timeout,
             )
-        except requests.exceptions.ConnectionError:
-            raise APIError("Cannot connect to the backend. Make sure the server is running.")
-        except requests.exceptions.Timeout:
-            raise APIError("Request timed out. The server took too long to respond.")
-        except requests.exceptions.RequestException as exc:
-            raise APIError(f"Request failed: {exc}")
+        except Exception as exc:
+            self._handle_request_exception(exc)
         return self._parse_response(response)
 
-    def _put(self, path: str, json: Any = None, timeout: int = DEFAULT_TIMEOUT) -> Any:
+    def _put(
+        self,
+        path: str,
+        json: Any = None,
+        timeout: int = DEFAULT_TIMEOUT,
+    ) -> Any:
         try:
             response = self._session.put(self._url(path), json=json, timeout=timeout)
-        except requests.exceptions.ConnectionError:
-            raise APIError("Cannot connect to the backend. Make sure the server is running.")
-        except requests.exceptions.Timeout:
-            raise APIError("Request timed out. The server took too long to respond.")
-        except requests.exceptions.RequestException as exc:
-            raise APIError(f"Request failed: {exc}")
+        except Exception as exc:
+            self._handle_request_exception(exc)
         return self._parse_response(response)
 
     def _delete(self, path: str, timeout: int = DEFAULT_TIMEOUT) -> Any:
         try:
             response = self._session.delete(self._url(path), timeout=timeout)
-        except requests.exceptions.ConnectionError:
-            raise APIError("Cannot connect to the backend. Make sure the server is running.")
-        except requests.exceptions.Timeout:
-            raise APIError("Request timed out. The server took too long to respond.")
-        except requests.exceptions.RequestException as exc:
-            raise APIError(f"Request failed: {exc}")
+        except Exception as exc:
+            self._handle_request_exception(exc)
         return self._parse_response(response)
 
     # ──────────────────────────────────────────────────────────
@@ -135,7 +144,8 @@ class APIClient:
     # ──────────────────────────────────────────────────────────
 
     def health_check(self) -> dict:
-        return self._get("/health", timeout=5)
+        result = self._get("/health", timeout=5)
+        return result if isinstance(result, dict) else {}
 
     # ──────────────────────────────────────────────────────────
     # Auth
@@ -159,16 +169,17 @@ class APIClient:
         result = self._post("/auth/register", json=payload)
         if isinstance(result, dict) and result.get("access_token"):
             self.set_token(result["access_token"])
-        return result
+        return result if isinstance(result, dict) else {}
 
     def login(self, email: str, password: str) -> dict:
         result = self._post("/auth/login", json={"email": email, "password": password})
         if isinstance(result, dict) and result.get("access_token"):
             self.set_token(result["access_token"])
-        return result
+        return result if isinstance(result, dict) else {}
 
     def get_me(self) -> dict:
-        return self._get("/auth/me")
+        result = self._get("/auth/me")
+        return result if isinstance(result, dict) else {}
 
     def update_me(
         self,
@@ -186,7 +197,8 @@ class APIClient:
             payload["username"] = username
         if password is not None:
             payload["password"] = password
-        return self._put("/auth/me", json=payload)
+        result = self._put("/auth/me", json=payload)
+        return result if isinstance(result, dict) else {}
 
     # ──────────────────────────────────────────────────────────
     # Receipts
@@ -198,14 +210,14 @@ class APIClient:
             raise APIError(f"File not found: {path}")
 
         mime_map = {
-            ".jpg":  "image/jpeg",
+            ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
-            ".png":  "image/png",
+            ".png": "image/png",
             ".webp": "image/webp",
-            ".bmp":  "image/bmp",
-            ".tif":  "image/tiff",
+            ".bmp": "image/bmp",
+            ".tif": "image/tiff",
             ".tiff": "image/tiff",
-            ".pdf":  "application/pdf",
+            ".pdf": "application/pdf",
         }
         mime_type = mime_map.get(path.suffix.lower(), "application/octet-stream")
 
@@ -213,7 +225,7 @@ class APIClient:
             files = {"file": (path.name, fh, mime_type)}
             result = self._post("/receipts/upload", files=files, timeout=UPLOAD_TIMEOUT)
 
-        return result
+        return result if isinstance(result, dict) else {}
 
     def list_receipts(
         self,
@@ -233,10 +245,13 @@ class APIClient:
             params["search"] = search
         if needs_review is not None:
             params["needs_review"] = needs_review
-        return self._get("/receipts", params=params)
+
+        result = self._get("/receipts", params=params, timeout=PROCESSING_TIMEOUT)
+        return result if isinstance(result, dict) else {}
 
     def get_receipt(self, receipt_id: int) -> dict:
-        return self._get(f"/receipts/{receipt_id}")
+        result = self._get(f"/receipts/{receipt_id}", timeout=PROCESSING_TIMEOUT)
+        return result if isinstance(result, dict) else {}
 
     def update_receipt(
         self,
@@ -264,13 +279,17 @@ class APIClient:
             payload["notes"] = notes
         if receipt_date is not None:
             payload["receipt_date"] = receipt_date
-        return self._put(f"/receipts/{receipt_id}", json=payload)
+
+        result = self._put(f"/receipts/{receipt_id}", json=payload, timeout=PROCESSING_TIMEOUT)
+        return result if isinstance(result, dict) else {}
 
     def delete_receipt(self, receipt_id: int) -> dict | None:
-        return self._delete(f"/receipts/{receipt_id}")
+        result = self._delete(f"/receipts/{receipt_id}")
+        return result if isinstance(result, dict) or result is None else None
 
     def reprocess_receipt(self, receipt_id: int) -> dict:
-        return self._post(f"/receipts/{receipt_id}/reprocess")
+        result = self._post(f"/receipts/{receipt_id}/reprocess", timeout=PROCESSING_TIMEOUT)
+        return result if isinstance(result, dict) else {}
 
     def correct_category(
         self,
@@ -281,36 +300,45 @@ class APIClient:
         payload: dict[str, Any] = {"category": category}
         if subcategory is not None:
             payload["subcategory"] = subcategory
-        return self._post(f"/receipts/{receipt_id}/correct-category", json=payload)
+        result = self._post(f"/receipts/{receipt_id}/correct-category", json=payload)
+        return result if isinstance(result, dict) else {}
 
     # ──────────────────────────────────────────────────────────
     # Analytics
     # ──────────────────────────────────────────────────────────
 
     def get_analytics(self, period: str = "month") -> dict:
-        return self._get("/analytics", params={"period": period})
+        result = self._get("/analytics", params={"period": period})
+        return result if isinstance(result, dict) else {}
 
     def get_summary(self, period: str = "month") -> dict:
-        return self._get("/analytics/summary", params={"period": period})
+        result = self._get("/analytics/summary", params={"period": period})
+        return result if isinstance(result, dict) else {}
 
     def get_recent(self, limit: int = 10) -> list:
-        return self._get("/analytics/recent", params={"limit": limit})
+        result = self._get("/analytics/recent", params={"limit": limit})
+        return result if isinstance(result, list) else []
 
     # ──────────────────────────────────────────────────────────
     # Advisor
     # ──────────────────────────────────────────────────────────
 
     def get_insights(self, period: str = "month") -> list:
-        return self._get("/advisor/insights", params={"period": period})
+        result = self._get("/advisor/insights", params={"period": period})
+        return result if isinstance(result, list) else []
 
     def get_auto_insights(self, period: str = "month") -> list:
-        return self._get("/advisor/insights/auto", params={"period": period})
+        result = self._get("/advisor/insights/auto", params={"period": period})
+        return result if isinstance(result, list) else []
 
     def ask_advisor(self, question: str, period: str = "month") -> dict:
-        return self._post(
+        result = self._post(
             "/advisor/ask",
-            json={"question": question, "period": period},
+            json={"question": question},
+            params={"period": period},
+            timeout=PROCESSING_TIMEOUT,
         )
+        return result if isinstance(result, dict) else {}
 
 
 api = APIClient()

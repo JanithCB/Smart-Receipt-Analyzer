@@ -1,9 +1,12 @@
 # src/desktop/views.py
 
+from asyncio import timeout
 import logging
 import math
 from pathlib import Path
 from typing import Any
+from desktop.api_client import api as _api
+
 
 from PySide6.QtCore import (
     QMimeData,
@@ -27,10 +30,12 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -39,6 +44,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -49,9 +55,6 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
-    QFileDialog,
-    QProgressBar,
-    QCheckBox,
 )
 
 from desktop.workers import (
@@ -60,6 +63,7 @@ from desktop.workers import (
     make_analytics_worker,
     make_ask_advisor_worker,
     make_auto_insights_worker,
+    make_correct_category_worker,
     make_delete_receipt_worker,
     make_get_receipt_worker,
     make_insights_worker,
@@ -69,7 +73,6 @@ from desktop.workers import (
     make_reprocess_receipt_worker,
     make_summary_worker,
     make_update_receipt_worker,
-    make_correct_category_worker,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,34 +97,29 @@ CATEGORIES = [
 CURRENCIES = ["LKR", "USD", "EUR", "GBP", "INR", "AUD", "CAD", "JPY"]
 
 PERIOD_OPTIONS = [
-    ("This Week",  "week"),
+    ("This Week", "week"),
     ("This Month", "month"),
-    ("This Year",  "year"),
-    ("All Time",   "all"),
+    ("This Year", "year"),
+    ("All Time", "all"),
 ]
 
-# Distinct, vibrant category colours used in charts
 CATEGORY_COLORS: dict[str, str] = {
-    "Groceries":     "#34d399",   # emerald
-    "Dining":        "#f97316",   # orange
-    "Transport":     "#60a5fa",   # blue
-    "Utilities":     "#a78bfa",   # violet
-    "Healthcare":    "#f472b6",   # pink
-    "Shopping":      "#facc15",   # yellow
-    "Entertainment": "#fb7185",   # rose
-    "Education":     "#38bdf8",   # sky
-    "Travel":        "#4ade80",   # green
-    "Finance":       "#e879f9",   # fuchsia
-    "Other":         "#94a3b8",   # slate
+    "Groceries": "#34d399",
+    "Dining": "#f97316",
+    "Transport": "#60a5fa",
+    "Utilities": "#a78bfa",
+    "Healthcare": "#f472b6",
+    "Shopping": "#facc15",
+    "Entertainment": "#fb7185",
+    "Education": "#38bdf8",
+    "Travel": "#4ade80",
+    "Finance": "#e879f9",
+    "Other": "#94a3b8",
 }
+
 
 def _category_color(category: str) -> str:
     return CATEGORY_COLORS.get(category, "#6b7280")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Shared helper widgets
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 def _make_divider() -> QFrame:
@@ -162,7 +160,6 @@ class KpiCard(QFrame):
         super().__init__(parent)
         self.setObjectName("card")
         self.setMinimumWidth(160)
-        self._accent = accent
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
@@ -182,17 +179,7 @@ class KpiCard(QFrame):
         self._value.setText(value)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Pie Chart Widget (QPainter based, no external deps)
-# ──────────────────────────────────────────────────────────────────────────────
-
-
 class PieChartWidget(QWidget):
-    """
-    Draws a coloured donut pie chart for category breakdown.
-    Pass a list of dicts with 'category', 'amount', 'percentage'.
-    """
-
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._data: list[dict] = []
@@ -224,44 +211,49 @@ class PieChartWidget(QWidget):
         if total == 0:
             return
 
-        start_angle = 90 * 16  # QPainter angles are in 1/16 degree units, start at top
+        start_angle = 90 * 16
 
         for item in self._data:
             amount = float(item.get("amount", 0) or 0)
             span = int((amount / total) * 360 * 16)
             color = QColor(_category_color(item.get("category", "Other")))
 
-            # Draw outer arc slice
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(color))
             painter.drawPie(cx - r_outer, cy - r_outer, r_outer * 2, r_outer * 2, start_angle, span)
             start_angle += span
 
-        # Draw inner circle to make it a donut
         painter.setBrush(QBrush(QColor("#14161f")))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(cx - r_inner, cy - r_inner, r_inner * 2, r_inner * 2)
 
-        # Center text: total
         painter.setPen(QColor("#ffffff"))
         font = painter.font()
         font.setPointSize(10)
         font.setBold(True)
         painter.setFont(font)
-        painter.drawText(cx - r_inner, cy - 12, r_inner * 2, 24,
-                         Qt.AlignmentFlag.AlignCenter, "TOTAL")
+        painter.drawText(
+            cx - r_inner,
+            cy - 12,
+            r_inner * 2,
+            24,
+            Qt.AlignmentFlag.AlignCenter,
+            "TOTAL",
+        )
+
         font.setPointSize(9)
         font.setBold(False)
         painter.setFont(font)
         painter.setPen(QColor("#9ca3af"))
         total_text = f"{total:,.0f}"
-        painter.drawText(cx - r_inner, cy + 2, r_inner * 2, 20,
-                         Qt.AlignmentFlag.AlignCenter, total_text)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Legend Widget for pie chart
-# ──────────────────────────────────────────────────────────────────────────────
+        painter.drawText(
+            cx - r_inner,
+            cy + 2,
+            r_inner * 2,
+            20,
+            Qt.AlignmentFlag.AlignCenter,
+            total_text,
+        )
 
 
 class PieLegend(QWidget):
@@ -288,9 +280,7 @@ class PieLegend(QWidget):
 
             dot = QFrame()
             dot.setFixedSize(12, 12)
-            dot.setStyleSheet(
-                f"background-color: {color}; border-radius: 6px;"
-            )
+            dot.setStyleSheet(f"background-color: {color}; border-radius: 6px;")
             row.addWidget(dot)
 
             name_lbl = QLabel(cat)
@@ -318,18 +308,7 @@ class PieLegend(QWidget):
         self._layout.addStretch()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Histogram / Bar Chart Widget (QPainter based)
-# ──────────────────────────────────────────────────────────────────────────────
-
-
 class BarChartWidget(QWidget):
-    """
-    A proper bar chart drawn with QPainter.
-    Supports category-coloured bars or a single accent colour.
-    Pass items as list[dict] with value_key and label_key.
-    """
-
     def __init__(
         self,
         accent_color: str = "#3b82f6",
@@ -381,7 +360,6 @@ class BarChartWidget(QWidget):
         if max_val == 0:
             max_val = 1
 
-        # Draw grid lines
         grid_steps = 4
         painter.setPen(QPen(QColor("#242630"), 1))
         font = painter.font()
@@ -393,15 +371,18 @@ class BarChartWidget(QWidget):
             painter.setPen(QPen(QColor("#242630"), 1))
             painter.drawLine(pad_left, y, pad_left + chart_w, y)
 
-            # Y axis labels
             grid_val = (max_val / grid_steps) * i
             painter.setPen(QColor("#6b7280"))
-            label = f"{grid_val:,.0f}" if grid_val < 10000 else f"{grid_val/1000:.0f}k"
-            painter.drawText(0, y - 8, pad_left - 4, 16,
-                             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                             label)
+            label = f"{grid_val:,.0f}" if grid_val < 10000 else f"{grid_val / 1000:.0f}k"
+            painter.drawText(
+                0,
+                y - 8,
+                pad_left - 4,
+                16,
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                label,
+            )
 
-        # Draw bars
         n = len(self._items)
         group_w = chart_w / n
         bar_w = max(8, int(group_w * 0.55))
@@ -417,7 +398,6 @@ class BarChartWidget(QWidget):
             else:
                 color = QColor(self._accent)
 
-            # Bar body
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(color))
             radius = min(4, bar_w // 3)
@@ -425,32 +405,27 @@ class BarChartWidget(QWidget):
             rect_path.addRoundedRect(x, y, bar_w, bar_h, radius, radius)
             painter.drawPath(rect_path)
 
-            # Value label above bar
             if bar_h > 14:
                 painter.setPen(QColor("#9ca3af"))
                 val_font = painter.font()
                 val_font.setPointSize(7)
                 painter.setFont(val_font)
-                val_text = f"{val:,.0f}" if val < 10000 else f"{val/1000:.1f}k"
-                painter.drawText(x - 4, y - 14, bar_w + 8, 12,
-                                 Qt.AlignmentFlag.AlignHCenter, val_text)
+                val_text = f"{val:,.0f}" if val < 10000 else f"{val / 1000:.1f}k"
+                painter.drawText(x - 4, y - 14, bar_w + 8, 12, Qt.AlignmentFlag.AlignHCenter, val_text)
 
-            # X axis label
             label_text = str(item.get(self._label_key, ""))[:10]
             painter.setPen(QColor("#6b7280"))
             lbl_font = painter.font()
             lbl_font.setPointSize(8)
             painter.setFont(lbl_font)
             painter.drawText(
-                x - 10, pad_top + chart_h + 6, bar_w + 20, 36,
+                x - 10,
+                pad_top + chart_h + 6,
+                bar_w + 20,
+                36,
                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
                 label_text,
             )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Legacy SimpleBarChart kept for compatibility
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 class SimpleBarChart(QWidget):
@@ -513,13 +488,8 @@ class SimpleBarChart(QWidget):
         self._layout.addStretch()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# LoginView
-# ──────────────────────────────────────────────────────────────────────────────
-
-
 class LoginView(QWidget):
-    login_success      = Signal(dict)
+    login_success = Signal(dict)
     switch_to_register = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -586,7 +556,7 @@ class LoginView(QWidget):
 
     @Slot()
     def _on_login(self) -> None:
-        email    = self._email.text().strip()
+        email = self._email.text().strip()
         password = self._password.text()
         self._error_label.hide()
 
@@ -620,14 +590,9 @@ class LoginView(QWidget):
         self._error_label.show()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# RegisterView
-# ──────────────────────────────────────────────────────────────────────────────
-
-
 class RegisterView(QWidget):
     register_success = Signal(dict)
-    switch_to_login  = Signal()
+    switch_to_login = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -706,10 +671,10 @@ class RegisterView(QWidget):
     @Slot()
     def _on_register(self) -> None:
         full_name = self._full_name.text().strip()
-        username  = self._username.text().strip()
-        email     = self._email.text().strip()
-        password  = self._password.text()
-        confirm   = self._confirm.text()
+        username = self._username.text().strip()
+        email = self._email.text().strip()
+        password = self._password.text()
+        confirm = self._confirm.text()
         self._error_label.hide()
 
         if not username or not email or not password:
@@ -753,11 +718,6 @@ class RegisterView(QWidget):
     def _clear_fields(self) -> None:
         self._password.clear()
         self._confirm.clear()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# UploadView  — BUG 4 FIX: polls each uploaded receipt until processing done
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 class _DropArea(QFrame):
@@ -813,16 +773,13 @@ class UploadView(QWidget):
     upload_complete = Signal()
 
     ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".pdf"}
-
-    # How often to poll (ms) and how many attempts before giving up
     POLL_INTERVAL_MS = 2500
     POLL_MAX_ATTEMPTS = 20
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._queued_files: list[Path] = []
-        # Maps receipt_id -> {filename, attempts, timer}
-        self._polling: dict[int, dict] = {}
+        self._polling: dict[int, dict[str, Any]] = {}
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -868,6 +825,7 @@ class UploadView(QWidget):
         self._status_list.setSpacing(4)
         status_container = QWidget()
         status_container.setLayout(self._status_list)
+
         scroll = QScrollArea()
         scroll.setWidget(status_container)
         scroll.setWidgetResizable(True)
@@ -877,7 +835,6 @@ class UploadView(QWidget):
         layout.addStretch()
 
     def _add_files(self, paths: list[str]) -> None:
-        added = 0
         for raw_path in paths:
             path = Path(raw_path)
             if path.suffix.lower() not in self.ALLOWED_EXTENSIONS:
@@ -886,7 +843,6 @@ class UploadView(QWidget):
             if path not in self._queued_files:
                 self._queued_files.append(path)
                 self._add_status_row(path.name, "Queued", "#6b7280")
-                added += 1
 
         self._update_queue_label()
         self._upload_btn.setEnabled(bool(self._queued_files))
@@ -901,10 +857,10 @@ class UploadView(QWidget):
         for i in range(self._status_list.count()):
             item = self._status_list.itemAt(i)
             if item and item.widget():
-                w = item.widget()
-                if w.property("filename") == filename:
-                    w.setText(f"  {filename}  —  {status_text}")
-                    w.setStyleSheet(f"color: {color}; font-size: 12px; padding: 2px 0;")
+                widget = item.widget()
+                if widget.property("filename") == filename:
+                    widget.setText(f"  {filename}  —  {status_text}")
+                    widget.setStyleSheet(f"color: {color}; font-size: 12px; padding: 2px 0;")
                     return
 
     def _update_queue_label(self) -> None:
@@ -948,20 +904,11 @@ class UploadView(QWidget):
         worker.signals.finished.connect(self._on_all_done)
         POOL.start(worker)
 
-    # ── BUG 4 FIX ─────────────────────────────────────────────────────────────
-    # After upload API returns, the receipt is still "pending" — OCR runs in a
-    # background task on the server. We start a per-receipt polling timer that
-    # checks every POLL_INTERVAL_MS until status == "done" or "failed",
-    # then updates the row and emits upload_complete to refresh other views.
-    # ──────────────────────────────────────────────────────────────────────────
-
     @Slot(str, object)
     def _on_file_done(self, filename: str, receipt: Any) -> None:
-        """File was saved on server. Now poll until OCR processing finishes."""
         receipt_id = receipt.get("id") if isinstance(receipt, dict) else None
 
         if receipt_id is None:
-            # No ID returned — fall back to original simple behaviour
             self._update_status_row(filename, "Uploaded ✓", "#4ade80")
             self.upload_complete.emit()
             return
@@ -974,9 +921,9 @@ class UploadView(QWidget):
             "filename": filename,
             "attempts": 0,
             "timer": timer,
+            "in_flight": False,
         }
 
-        # Capture receipt_id in closure
         timer.timeout.connect(lambda rid=receipt_id: self._poll_receipt(rid))
         timer.start(self.POLL_INTERVAL_MS)
 
@@ -985,30 +932,40 @@ class UploadView(QWidget):
         if poll_info is None:
             return
 
+        if poll_info.get("in_flight"):
+            return
+
         poll_info["attempts"] += 1
         if poll_info["attempts"] > self.POLL_MAX_ATTEMPTS:
             self._stop_polling(receipt_id, timeout=True)
             return
 
+        poll_info["in_flight"] = True
+
         worker = make_get_receipt_worker(receipt_id)
         worker.signals.result.connect(lambda data, rid=receipt_id: self._on_poll_result(rid, data))
-        worker.signals.error.connect(lambda _err, rid=receipt_id: None)  # silently retry
+        worker.signals.error.connect(lambda _err, rid=receipt_id: self._on_poll_error(rid))
         POOL.start(worker)
 
     @Slot(int, object)
     def _on_poll_result(self, receipt_id: int, data: Any) -> None:
         poll_info = self._polling.get(receipt_id)
-        if poll_info is None or not isinstance(data, dict):
+        if poll_info is None:
             return
 
-        status = data.get("processing_status", "")
+        poll_info["in_flight"] = False
+
+        if not isinstance(data, dict):
+            return
+
+        status = (data.get("processing_status") or "").lower()
         filename = poll_info["filename"]
 
         if status == "done":
             merchant = data.get("merchant") or "Unknown merchant"
             amount = data.get("total_amount")
             amount_str = f"{float(amount):,.2f}" if amount is not None else "—"
-            currency = data.get("currency") or ""
+            currency = data.get("currency") or "LKR"
             self._update_status_row(
                 filename,
                 f"Done ✓  {merchant}  {currency} {amount_str}",
@@ -1016,27 +973,46 @@ class UploadView(QWidget):
             )
             self._stop_polling(receipt_id)
             self.upload_complete.emit()
-
         elif status == "failed":
             self._update_status_row(filename, "Processing failed", "#f87171")
             self._stop_polling(receipt_id)
             self.upload_complete.emit()
 
-        # If still "pending" or "processing", keep polling until timeout
+    def _on_poll_error(self, receipt_id: int) -> None:
+        poll_info = self._polling.get(receipt_id)
+        if poll_info is not None:
+            poll_info["in_flight"] = False
 
     def _stop_polling(self, receipt_id: int, timeout: bool = False) -> None:
         poll_info = self._polling.pop(receipt_id, None)
-        if poll_info:
-            poll_info["timer"].stop()
-            if timeout:
-                self._update_status_row(
-                    poll_info["filename"],
-                    "Uploaded (processing taking longer than expected)",
-                    "#fb923c",
-                )
-                self.upload_complete.emit()
+        if not poll_info:
+            return
 
-    # ── end BUG 4 FIX ─────────────────────────────────────────────────────────
+        timer = poll_info.get("timer")
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+
+        poll_info["in_flight"] = False
+
+        if timeout:
+            self._update_status_row(
+                poll_info["filename"],
+                "Uploaded (processing taking longer than expected)",
+                "#fb923c",
+            )
+        self.upload_complete.emit()
+
+
+def stop_all_polling(self) -> None:
+    """Stop every active receipt polling timer.
+
+    Call this on logout so that background QTimers do not continue making
+    authenticated API calls after the JWT token has been cleared.
+    """
+    # Iterate over a snapshot because _stop_polling mutates self._polling
+    for receipt_id in list(self._polling.keys()):
+        self._stop_polling(receipt_id)
 
     @Slot(str, str)
     def _on_file_error(self, filename: str, message: str) -> None:
@@ -1051,11 +1027,6 @@ class UploadView(QWidget):
         self._queued_files.clear()
         self._update_queue_label()
         self._upload_btn.setEnabled(False)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Edit receipt dialog
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 class EditReceiptDialog(QDialog):
@@ -1125,24 +1096,19 @@ class EditReceiptDialog(QDialog):
 
     def get_data(self) -> dict:
         return {
-            "merchant":     self._merchant.text().strip() or None,
+            "merchant": self._merchant.text().strip() or None,
             "total_amount": self._amount.value(),
-            "currency":     self._currency.currentText(),
-            "category":     self._category.currentText(),
-            "notes":        self._notes.toPlainText().strip() or None,
+            "currency": self._currency.currentText(),
+            "category": self._category.currentText(),
+            "notes": self._notes.toPlainText().strip() or None,
         }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ReceiptsView
-# ──────────────────────────────────────────────────────────────────────────────
 
 
 class ReceiptsView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._current_page     = 1
-        self._total_pages      = 1
+        self._current_page = 1
+        self._total_pages = 1
         self._receipts_cache: list[dict] = []
         self._build_ui()
 
@@ -1154,6 +1120,7 @@ class ReceiptsView(QWidget):
         header_row = QHBoxLayout()
         header_row.addWidget(_make_section_title("Receipts"))
         header_row.addStretch()
+
         refresh_btn = QPushButton("Refresh")
         refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         refresh_btn.clicked.connect(self.refresh)
@@ -1233,14 +1200,18 @@ class ReceiptsView(QWidget):
         search = self._search.text().strip()
         if search:
             filters["search"] = search
+
         cat = self._category_filter.currentText()
         if cat != "All":
             filters["category"] = cat
+
         status = self._status_filter.currentText()
         if status != "All status":
             filters["status"] = status
+
         if self._review_filter.isChecked():
             filters["needs_review"] = True
+
         return filters
 
     def _load_receipts(self, page: int) -> None:
@@ -1258,20 +1229,19 @@ class ReceiptsView(QWidget):
             return
 
         receipts = payload.get("receipts") or payload.get("items") or []
-        total    = payload.get("total", 0)
-        page     = payload.get("page", 1)
-        pages    = payload.get("pages") or payload.get("total_pages", 1)
+        total = payload.get("total", 0)
+        page = payload.get("page", 1)
+        pages = payload.get("pages") or payload.get("total_pages", 1)
 
-        # Handle nested pagination object
         if isinstance(payload.get("pagination"), dict):
             pag = payload["pagination"]
             total = pag.get("total_items", total)
-            page  = pag.get("page", page)
+            page = pag.get("page", page)
             pages = pag.get("total_pages", pages)
 
         self._receipts_cache = receipts
-        self._current_page   = page
-        self._total_pages    = max(1, pages)
+        self._current_page = page
+        self._total_pages = max(1, pages)
 
         self._populate_table(receipts)
         self._page_label.setText(f"Page {page} of {self._total_pages}")
@@ -1296,6 +1266,7 @@ class ReceiptsView(QWidget):
 
             self._table.setItem(row, 0, QTableWidgetItem(str(date_val)))
             self._table.setItem(row, 1, QTableWidgetItem(receipt.get("merchant") or "—"))
+
             amount = receipt.get("total_amount")
             amount_text = f"{float(amount):,.2f}" if amount is not None else "—"
             self._table.setItem(row, 2, QTableWidgetItem(amount_text))
@@ -1344,6 +1315,7 @@ class ReceiptsView(QWidget):
             action_layout.addWidget(edit_btn)
             action_layout.addWidget(delete_btn)
             action_layout.addStretch()
+
             self._table.setCellWidget(row, 6, action_widget)
             self._table.setRowHeight(row, 42)
 
@@ -1389,7 +1361,6 @@ class ReceiptsView(QWidget):
             self._current_page += 1
             self._load_receipts(self._current_page)
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # AnalyticsView — BUG 3 FIX: shows pending_count warning + proper charts
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1410,7 +1381,6 @@ class AnalyticsView(QWidget):
         layout.setContentsMargins(28, 28, 28, 28)
         layout.setSpacing(20)
 
-        # ── Header row ──────────────────────────────────────────────────────
         header_row = QHBoxLayout()
         header_row.addWidget(_make_section_title("Analytics"))
         header_row.addStretch()
@@ -1424,7 +1394,6 @@ class AnalyticsView(QWidget):
         header_row.addWidget(self._period_combo)
         layout.addLayout(header_row)
 
-        # ── BUG 3 FIX: pending receipts warning banner ───────────────────────
         self._pending_banner = QLabel("")
         self._pending_banner.setStyleSheet(
             "background-color: #2d2000; border: 1px solid #b45309; border-radius: 8px;"
@@ -1434,20 +1403,18 @@ class AnalyticsView(QWidget):
         self._pending_banner.hide()
         layout.addWidget(self._pending_banner)
 
-        # ── KPI cards ────────────────────────────────────────────────────────
         kpi_row = QHBoxLayout()
         kpi_row.setSpacing(12)
-        self._kpi_total   = KpiCard("Total Spend",   accent="#34d399")
-        self._kpi_count   = KpiCard("Receipts",      accent="#60a5fa")
-        self._kpi_avg     = KpiCard("Avg Amount",    accent="#a78bfa")
-        self._kpi_top_cat = KpiCard("Top Category",  accent="#f97316")
+        self._kpi_total = KpiCard("Total Spend", accent="#34d399")
+        self._kpi_count = KpiCard("Receipts", accent="#60a5fa")
+        self._kpi_avg = KpiCard("Avg Amount", accent="#a78bfa")
+        self._kpi_top_cat = KpiCard("Top Category", accent="#f97316")
         for kpi in (self._kpi_total, self._kpi_count, self._kpi_avg, self._kpi_top_cat):
             kpi_row.addWidget(kpi)
         layout.addLayout(kpi_row)
 
         layout.addWidget(_make_divider())
 
-        # ── Category breakdown: pie + legend ─────────────────────────────────
         cat_title = QLabel("Spending by Category")
         cat_title.setStyleSheet("font-size: 15px; font-weight: 600; color: #e5e7eb;")
         layout.addWidget(cat_title)
@@ -1467,7 +1434,6 @@ class AnalyticsView(QWidget):
 
         layout.addWidget(_make_divider())
 
-        # ── Monthly trend histogram ────────────────────────────────────────
         trend_title = QLabel("Monthly Spend Trend")
         trend_title.setStyleSheet("font-size: 15px; font-weight: 600; color: #e5e7eb;")
         layout.addWidget(trend_title)
@@ -1478,7 +1444,6 @@ class AnalyticsView(QWidget):
 
         layout.addWidget(_make_divider())
 
-        # ── Top merchants bar chart ─────────────────────────────────────────
         merch_title = QLabel("Top Merchants")
         merch_title.setStyleSheet("font-size: 15px; font-weight: 600; color: #e5e7eb;")
         layout.addWidget(merch_title)
@@ -1512,14 +1477,14 @@ class AnalyticsView(QWidget):
     def _on_summary_loaded(self, data: Any) -> None:
         self._status_label.setText("")
         if not isinstance(data, dict):
+            self._status_label.setText("Unexpected analytics response.")
             return
 
-        total   = float(data.get("total_spend") or 0)
-        count   = int(data.get("receipt_count") or 0)
-        avg     = float(data.get("average_spend") or 0)
+        total = float(data.get("total_spend") or 0)
+        count = int(data.get("receipt_count") or 0)
+        avg = float(data.get("average_spend") or 0)
         top_cat = data.get("top_category") or "—"
 
-        # ── BUG 3 FIX: show warning if receipts are still processing ─────────
         pending_count = int(data.get("pending_count") or 0)
         if pending_count > 0:
             s = "s" if pending_count != 1 else ""
@@ -1531,7 +1496,13 @@ class AnalyticsView(QWidget):
         else:
             self._pending_banner.hide()
 
-        currency = "LKR"
+        currency = (
+            data.get("currency")
+            or data.get("base_currency")
+            or data.get("display_currency")
+            or "LKR"
+        )
+
         self._kpi_total.set_value(f"{currency} {total:,.2f}")
         self._kpi_count.set_value(str(count))
         self._kpi_avg.set_value(f"{currency} {avg:,.2f}")
@@ -1549,6 +1520,7 @@ class AnalyticsView(QWidget):
 
     @Slot(str)
     def _on_error(self, message: str) -> None:
+        self._pending_banner.hide()
         self._status_label.setText(f"Error loading analytics: {message}")
 
 
@@ -1559,9 +1531,9 @@ class AnalyticsView(QWidget):
 
 class InsightCard(QFrame):
     TYPE_COLORS = {
-        "trend":   ("#1e3a5f", "#60a5fa"),
-        "alert":   ("#3b1f1f", "#f87171"),
-        "tip":     ("#1a2e1a", "#4ade80"),
+        "trend": ("#1e3a5f", "#60a5fa"),
+        "alert": ("#3b1f1f", "#f87171"),
+        "tip": ("#1a2e1a", "#4ade80"),
         "anomaly": ("#3b2a10", "#fb923c"),
     }
     DEFAULT_COLORS = ("#1f2330", "#9ca3af")
@@ -1569,7 +1541,7 @@ class InsightCard(QFrame):
     def __init__(self, insight: dict, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("card")
-        insight_type = insight.get("type", "tip")
+        insight_type = str(insight.get("type", "tip")).lower()
         bg, accent = self.TYPE_COLORS.get(insight_type, self.DEFAULT_COLORS)
 
         self.setStyleSheet(
@@ -1591,8 +1563,10 @@ class InsightCard(QFrame):
 
         category = insight.get("category")
         if category:
-            cat_label = QLabel(category)
-            cat_label.setStyleSheet(f"color: {_category_color(category)}; font-size: 11px; background: transparent;")
+            cat_label = QLabel(str(category))
+            cat_label.setStyleSheet(
+                f"color: {_category_color(str(category))}; font-size: 11px; background: transparent;"
+            )
             header.addWidget(cat_label)
 
         header.addStretch()
@@ -1610,14 +1584,14 @@ class InsightCard(QFrame):
 
         layout.addLayout(header)
 
-        title = QLabel(insight.get("title", "Insight"))
+        title = QLabel(str(insight.get("title", "Insight")))
         title.setStyleSheet(
             "color: #ffffff; font-size: 14px; font-weight: 600; background: transparent;"
         )
         title.setWordWrap(True)
         layout.addWidget(title)
 
-        message = QLabel(insight.get("message", ""))
+        message = QLabel(str(insight.get("message", "")))
         message.setStyleSheet("color: #d1d5db; font-size: 13px; background: transparent;")
         message.setWordWrap(True)
         layout.addWidget(message)
@@ -1683,18 +1657,18 @@ class InsightsView(QWidget):
         self._status_label.setText("")
         self._clear_cards()
 
-        if not data:
+        insights = data if isinstance(data, list) else []
+
+        if not insights:
             empty = _make_muted_label("No insights available yet. Upload more receipts to get started.")
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty.setStyleSheet("color: #6b7280; font-size: 13px; padding: 40px;")
             self._content_layout.addWidget(empty)
             return
 
-        insights = data if isinstance(data, list) else []
         for insight in insights:
             if isinstance(insight, dict):
-                card = InsightCard(insight)
-                self._content_layout.addWidget(card)
+                self._content_layout.addWidget(InsightCard(insight))
 
         self._content_layout.addStretch()
 
@@ -1729,13 +1703,11 @@ class _ChatBubble(QFrame):
         super().__init__(parent)
 
         if is_user:
-            bg      = "#1e3a5f"
-            color   = "#e2e2e2"
-            align   = Qt.AlignmentFlag.AlignRight
+            bg = "#1e3a5f"
+            color = "#e2e8f0"
         else:
-            bg      = "#1f2330"
-            color   = "#d1d5db"
-            align   = Qt.AlignmentFlag.AlignLeft
+            bg = "#1f2330"
+            color = "#d1d5db"
 
         self.setStyleSheet(
             f"QFrame {{ background-color: {bg}; border-radius: 10px; padding: 2px; }}"
@@ -1765,6 +1737,7 @@ class _ChatBubble(QFrame):
 class AskView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._thinking_bubble: _ChatBubble | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1772,14 +1745,28 @@ class AskView(QWidget):
         layout.setContentsMargins(28, 28, 28, 28)
         layout.setSpacing(14)
 
-        layout.addWidget(_make_section_title("Ask AI"))
+        header_row = QHBoxLayout()
+        header_row.addWidget(_make_section_title("Ask AI"))
+        header_row.addStretch()
+
+        self._period_combo = QComboBox()
+        for label, value in PERIOD_OPTIONS:
+            self._period_combo.addItem(label, userData=value)
+        self._period_combo.setCurrentIndex(1)
+        self._period_combo.setMinimumHeight(34)
+        header_row.addWidget(self._period_combo)
+
+        layout.addLayout(header_row)
         layout.addWidget(_make_muted_label("Ask questions about your spending and get grounded advice."))
 
         suggested_label = _make_muted_label("Suggested questions")
         layout.addWidget(suggested_label)
 
-        suggestions_row = QHBoxLayout()
-        suggestions_row.setSpacing(8)
+        suggestions_wrap = QWidget()
+        suggestions_layout = QHBoxLayout(suggestions_wrap)
+        suggestions_layout.setContentsMargins(0, 0, 0, 0)
+        suggestions_layout.setSpacing(8)
+
         for question in SUGGESTED_QUESTIONS:
             btn = QPushButton(question)
             btn.setStyleSheet(
@@ -1789,11 +1776,11 @@ class AskView(QWidget):
             )
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-            btn.clicked.connect(lambda checked, q=question: self._ask(q))
-            suggestions_row.addWidget(btn)
+            btn.clicked.connect(lambda _checked=False, q=question: self._ask(q))
+            suggestions_layout.addWidget(btn)
 
-        suggestions_row.addStretch()
-        layout.addLayout(suggestions_row)
+        suggestions_layout.addStretch()
+        layout.addWidget(suggestions_wrap)
 
         layout.addWidget(_make_divider())
 
@@ -1825,7 +1812,14 @@ class AskView(QWidget):
         self._send_btn.setMinimumHeight(42)
         self._send_btn.clicked.connect(self._on_send)
         input_row.addWidget(self._send_btn)
+
         layout.addLayout(input_row)
+
+        self._status_label = _make_muted_label("")
+        layout.addWidget(self._status_label)
+
+    def _get_period(self) -> str:
+        return self._period_combo.currentData() or "month"
 
     def _ask(self, question: str) -> None:
         self._input.setText(question)
@@ -1839,29 +1833,34 @@ class AskView(QWidget):
 
         self._input.clear()
         self._send_btn.setEnabled(False)
+        self._status_label.setText("")
+
         self._add_bubble(question, is_user=True)
 
         thinking = _ChatBubble("Thinking...", is_user=False)
-        self._chat_layout.addWidget(thinking)
+        self._insert_chat_widget(thinking)
         self._thinking_bubble = thinking
         self._scroll_to_bottom()
 
-        worker = make_ask_advisor_worker(question)
+        period = self._get_period()
+        worker = make_ask_advisor_worker(question, period=period)
         worker.signals.result.connect(self._on_answer)
         worker.signals.error.connect(self._on_ask_error)
         POOL.start(worker)
 
-    def _add_bubble(self, text: str, is_user: bool) -> None:
+    def _insert_chat_widget(self, widget: QWidget) -> None:
         stretch_item = self._chat_layout.itemAt(self._chat_layout.count() - 1)
         if stretch_item and stretch_item.spacerItem():
             self._chat_layout.removeItem(stretch_item)
-
-        bubble = _ChatBubble(text, is_user=is_user)
-        self._chat_layout.addWidget(bubble)
+        self._chat_layout.addWidget(widget)
         self._chat_layout.addStretch()
 
+    def _add_bubble(self, text: str, is_user: bool) -> None:
+        self._insert_chat_widget(_ChatBubble(text, is_user=is_user))
+
     def _remove_thinking_bubble(self) -> None:
-        if hasattr(self, "_thinking_bubble") and self._thinking_bubble:
+        if self._thinking_bubble is not None:
+            self._chat_layout.removeWidget(self._thinking_bubble)
             self._thinking_bubble.deleteLater()
             self._thinking_bubble = None
 
@@ -1871,7 +1870,7 @@ class AskView(QWidget):
         self._remove_thinking_bubble()
 
         if isinstance(data, dict):
-            answer = data.get("answer") or "No answer was returned."
+            answer = data.get("answer") or data.get("message") or "No answer was returned."
         elif isinstance(data, str):
             answer = data
         else:
@@ -1885,9 +1884,193 @@ class AskView(QWidget):
         self._send_btn.setEnabled(True)
         self._remove_thinking_bubble()
         self._add_bubble(f"Error: {message}", is_user=False)
+        self._status_label.setText("")
         self._scroll_to_bottom()
 
     def _scroll_to_bottom(self) -> None:
-        QTimer.singleShot(50, lambda: self._scroll.verticalScrollBar().setValue(
-            self._scroll.verticalScrollBar().maximum()
-        ))
+        QTimer.singleShot(
+            50,
+            lambda: self._scroll.verticalScrollBar().setValue(
+                self._scroll.verticalScrollBar().maximum()
+            ),
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main application shell
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class MainView(QWidget):
+    logout_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        sidebar = QFrame()
+        sidebar.setFixedWidth(220)
+        sidebar.setStyleSheet(
+            "QFrame { background-color: #11131a; border-right: 1px solid #242630; }"
+        )
+        side_layout = QVBoxLayout(sidebar)
+        side_layout.setContentsMargins(18, 22, 18, 18)
+        side_layout.setSpacing(10)
+
+        brand = QLabel("Vispend AI")
+        brand.setStyleSheet("font-size: 20px; font-weight: 700; color: #ffffff;")
+        side_layout.addWidget(brand)
+
+        subtitle = QLabel("Smart receipt manager")
+        subtitle.setStyleSheet("font-size: 12px; color: #6b7280;")
+        side_layout.addWidget(subtitle)
+        side_layout.addSpacing(12)
+
+        self._nav_buttons: dict[str, QPushButton] = {}
+        nav_items = [
+            ("upload", "Upload"),
+            ("receipts", "Receipts"),
+            ("analytics", "Analytics"),
+            ("insights", "Insights"),
+            ("ask", "Ask AI"),
+        ]
+
+        for key, label in nav_items:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setMinimumHeight(40)
+            btn.setStyleSheet(
+                "QPushButton { text-align: left; padding: 0 14px; border-radius: 8px; "
+                "background-color: transparent; color: #cbd5e1; border: 1px solid transparent; }"
+                "QPushButton:hover { background-color: #1a1d27; border-color: #2d3041; }"
+                "QPushButton:checked { background-color: #1d3557; color: #ffffff; border-color: #3b82f6; }"
+            )
+            btn.clicked.connect(lambda _checked=False, name=key: self._set_page(name))
+            side_layout.addWidget(btn)
+            self._nav_buttons[key] = btn
+
+        side_layout.addStretch()
+
+        logout_btn = QPushButton("Sign out")
+        logout_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        logout_btn.setMinimumHeight(38)
+        logout_btn.setStyleSheet(
+            "QPushButton { text-align: left; padding: 0 14px; border-radius: 8px; "
+            "background-color: #2a1a1a; color: #fca5a5; border: 1px solid #7f1d1d; }"
+            "QPushButton:hover { background-color: #3a1f1f; }"
+        )
+        logout_btn.clicked.connect(self.logout_requested.emit)
+        side_layout.addWidget(logout_btn)
+
+        root.addWidget(sidebar)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+
+        self._stack = QStackedWidget()
+        self.upload_view = UploadView()
+        self.receipts_view = ReceiptsView()
+        self.analytics_view = AnalyticsView()
+        self.insights_view = InsightsView()
+        self.ask_view = AskView()
+
+        self._stack.addWidget(self.upload_view)
+        self._stack.addWidget(self.receipts_view)
+        self._stack.addWidget(self.analytics_view)
+        self._stack.addWidget(self.insights_view)
+        self._stack.addWidget(self.ask_view)
+
+        content_layout.addWidget(self._stack)
+        root.addWidget(content)
+
+        self.upload_view.upload_complete.connect(self.receipts_view.refresh)
+        self.upload_view.upload_complete.connect(self.analytics_view.refresh)
+        self.upload_view.upload_complete.connect(self.insights_view.refresh)
+
+        self._set_page("upload")
+
+    def _set_page(self, name: str) -> None:
+        page_map = {
+            "upload": 0,
+            "receipts": 1,
+            "analytics": 2,
+            "insights": 3,
+            "ask": 4,
+        }
+        index = page_map.get(name, 0)
+        self._stack.setCurrentIndex(index)
+
+        for key, btn in self._nav_buttons.items():
+            btn.setChecked(key == name)
+
+        if name == "receipts":
+            self.receipts_view.refresh()
+        elif name == "analytics":
+            self.analytics_view.refresh()
+        elif name == "insights":
+            self.insights_view.refresh()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Root app container
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class AppView(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._user_payload: dict[str, Any] | None = None
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._stack = QStackedWidget()
+
+        self.login_view = LoginView()
+        self.register_view = RegisterView()
+        self.main_view = MainView()
+
+        self._stack.addWidget(self.login_view)
+        self._stack.addWidget(self.register_view)
+        self._stack.addWidget(self.main_view)
+
+        layout.addWidget(self._stack)
+
+        self.login_view.switch_to_register.connect(self._show_register)
+        self.register_view.switch_to_login.connect(self._show_login)
+        self.login_view.login_success.connect(self._on_auth_success)
+        self.register_view.register_success.connect(self._on_auth_success)
+        self.main_view.logout_requested.connect(self._logout)
+
+        self._show_login()
+
+    def _show_login(self) -> None:
+        self._stack.setCurrentWidget(self.login_view)
+
+    def _show_register(self) -> None:
+        self._stack.setCurrentWidget(self.register_view)
+
+    @Slot(object)
+    def _on_auth_success(self, payload: Any) -> None:
+        self._user_payload = payload if isinstance(payload, dict) else None
+        self._stack.setCurrentWidget(self.main_view)
+        self.main_view.receipts_view.refresh()
+        self.main_view.analytics_view.refresh()
+        self.main_view.insights_view.refresh()
+
+    def _logout(self) -> None:
+        _api.clear_token()
+        self._user_payload = None
+        self._show_login()
+
+

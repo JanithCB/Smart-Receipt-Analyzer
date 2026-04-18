@@ -1,3 +1,5 @@
+# src/backend/analytics_service.py
+
 from collections import defaultdict
 from datetime import datetime, timedelta
 from statistics import mean, pstdev
@@ -6,10 +8,10 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from backend.models import Receipt
+from backend.services import get_max_reasonable_receipt_amount
 
 VALID_PERIODS = {"week", "month", "year", "all"}
 PROCESSING_STATUSES_PENDING = {"uploaded", "processing", "pending"}
-MAX_REASONABLE_RECEIPT_AMOUNT = 1_000_000.0
 
 
 def _get_period_start(period: str) -> datetime | None:
@@ -47,7 +49,7 @@ def _pending_receipts_count(db: Session, user_id: int) -> int:
 def _is_reasonable_amount(amount: float | None) -> bool:
     if amount is None:
         return False
-    return 0 < float(amount) <= MAX_REASONABLE_RECEIPT_AMOUNT
+    return 0 < float(amount) <= get_max_reasonable_receipt_amount()
 
 
 def _clean_receipts(receipts: list[Receipt]) -> list[Receipt]:
@@ -61,6 +63,12 @@ def _clean_receipts(receipts: list[Receipt]) -> list[Receipt]:
 
 
 def _filter_receipts_by_period(receipts: list[Receipt], period: str) -> list[Receipt]:
+    """
+    Return only receipts whose reference date falls within the given period.
+    Reference date: receipt_date (actual spend date) or created_at as fallback.
+    The old second-pass logic that re-included receipts uploaded recently but
+    dated in an earlier period has been removed.
+    """
     if (period or "month").lower() == "all":
         return receipts
 
@@ -69,29 +77,20 @@ def _filter_receipts_by_period(receipts: list[Receipt], period: str) -> list[Rec
         return receipts
 
     filtered: list[Receipt] = []
-    now = datetime.utcnow()
-
     for receipt in receipts:
-        receipt_date = receipt.receipt_date
-        created_at = receipt.created_at
-
-        reference_date = receipt_date or created_at
-        if reference_date is None:
-            continue
-
-        if reference_date >= start:
+        reference_date = receipt.receipt_date or receipt.created_at
+        if reference_date is not None and reference_date >= start:
             filtered.append(receipt)
-            continue
-
-        if created_at and created_at >= start:
-            if receipt_date and receipt_date < start and receipt_date.year < now.year:
-                filtered.append(receipt)
 
     return filtered
 
 
 def detect_anomalies(receipts: list[Receipt]) -> list[dict[str, Any]]:
-    amounts = [float(r.total_amount) for r in receipts if r.total_amount is not None and _is_reasonable_amount(float(r.total_amount))]
+    amounts = [
+        float(r.total_amount)
+        for r in receipts
+        if r.total_amount is not None and _is_reasonable_amount(float(r.total_amount))
+    ]
     anomalies: list[dict[str, Any]] = []
 
     if len(amounts) < 3:
@@ -160,12 +159,13 @@ def get_spending_summary(db: Session, user_id: int, period: str = "month") -> di
             "total_spend": 0.0,
             "receipt_count": 0,
             "average_spend": 0.0,
+            "pending_count": pending_count,
             "top_category": None,
             "category_breakdown": [],
             "monthly_trend": [],
             "top_merchants": [],
             "anomalies": [],
-            "pending_count": pending_count,
+            "currency": "LKR",
         }
 
     total_spend = round(sum(float(r.total_amount or 0) for r in receipts), 2)
@@ -178,17 +178,21 @@ def get_spending_summary(db: Session, user_id: int, period: str = "month") -> di
     merchant_counts: dict[str, int] = defaultdict(int)
     monthly_amounts: dict[str, float] = defaultdict(float)
     monthly_counts: dict[str, int] = defaultdict(int)
+    currency_counts: dict[str, int] = defaultdict(int)
 
     for receipt in receipts:
         amount = float(receipt.total_amount or 0)
-        category = receipt.category or "Other"
-        merchant = receipt.merchant or "Unknown"
+        category = (receipt.category or "Other").strip() if receipt.category else "Other"
+        merchant = (receipt.merchant or "Unknown").strip() if receipt.merchant else "Unknown"
+        currency = (receipt.currency or "LKR").strip() if receipt.currency else "LKR"
 
         category_totals[category] += amount
         category_counts[category] += 1
 
         merchant_totals[merchant] += amount
         merchant_counts[merchant] += 1
+
+        currency_counts[currency] += 1
 
         reference_date = receipt.receipt_date or receipt.created_at
         if reference_date:
@@ -200,7 +204,11 @@ def get_spending_summary(db: Session, user_id: int, period: str = "month") -> di
     if category_totals:
         top_category = max(category_totals.items(), key=lambda item: item[1])[0]
 
-    category_breakdown = []
+    display_currency = "LKR"
+    if currency_counts:
+        display_currency = max(currency_counts.items(), key=lambda item: item[1])[0]
+
+    category_breakdown: list[dict[str, Any]] = []
     for category, amount in sorted(category_totals.items(), key=lambda item: item[1], reverse=True):
         percentage = round((amount / total_spend) * 100, 2) if total_spend > 0 else 0.0
         category_breakdown.append(
@@ -212,7 +220,7 @@ def get_spending_summary(db: Session, user_id: int, period: str = "month") -> di
             }
         )
 
-    monthly_trend = []
+    monthly_trend: list[dict[str, Any]] = []
     for month_key in sorted(monthly_amounts.keys()):
         monthly_trend.append(
             {
@@ -222,7 +230,7 @@ def get_spending_summary(db: Session, user_id: int, period: str = "month") -> di
             }
         )
 
-    top_merchants = []
+    top_merchants: list[dict[str, Any]] = []
     for merchant, amount in sorted(merchant_totals.items(), key=lambda item: item[1], reverse=True)[:10]:
         top_merchants.append(
             {
@@ -238,10 +246,11 @@ def get_spending_summary(db: Session, user_id: int, period: str = "month") -> di
         "total_spend": total_spend,
         "receipt_count": receipt_count,
         "average_spend": average_spend,
+        "pending_count": pending_count,
         "top_category": top_category,
         "category_breakdown": category_breakdown,
         "monthly_trend": monthly_trend,
         "top_merchants": top_merchants,
         "anomalies": anomalies,
-        "pending_count": pending_count,
+        "currency": display_currency,
     }
