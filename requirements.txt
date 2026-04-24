@@ -1,0 +1,15 @@
+opencv-python
+numpy
+pandas
+matplotlib
+requests
+groq
+streamlit
+deep-translator
+python-dotenv
+pillow
+plotly
+scikit-learn
+jupyter
+notebook
+ipykernel
