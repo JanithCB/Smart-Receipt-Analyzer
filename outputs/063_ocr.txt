@@ -1,0 +1,62 @@
+31 8 010ї
+oli
+!!
+SYARIKAT PERNIAGAAN GIN KEE
+(81109-A)
+NO 290, JALAN AIR PANAS,
+SETAPAK,
+53200, KUALA LUMPUR.
+TEL: 03-40210276
+GST ID: 000750673920
+SIMPLIFIED TAX INVOICE
+CASH
+Doc No:
+Cashier
+Salesperson
+CS00012944
+USER
+Item
+- 1007
+$12MM 4/8B PLYWOOD
+Total Qty:
+Qty
+3
+3
+Total Sales (Excluding GST) :
+Discount ::
+Total GST :
+Rounding :
+Total Sales (Inclusive of GST) :
+CASH :
+Change :
+Date: 25/01/2018
+Time: 14:29:00
+Ref.:
+S/Price
+63:60
+Tax
+SR
+Amount
+190.80
+190.80
+180.00
+0.00
+10.80
+0.00
+190.80
+190.80
+0.00
+GST SUMMARY
+Tax Code
+SR
+%
+6
+Total:
+Amt (RM)
+180.00
+180.00
+Tax (RM)
+10.80
+10.80
+10.80
+GOODS SOLD ARE NOT RETURNABLE, THANK YOU.

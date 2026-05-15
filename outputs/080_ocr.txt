@@ -1,0 +1,49 @@
+ALG RESTORAN RAN. SHENG
+:002043319-N7
+-N6:2, Jalan: Temenggung 19/9,:
+Seksyen 9; Bandar Mahkota Cheras;
+43200 Cheras, Selangor
+GST REG ND: 001335787520
+Tax Invoice
+:INV Nor:
+1049519 Cashier: Thandar
+:Date
+17-03-2018 15:22:52
+*Description
+Qty
+W price Total IAX
+Корі (B)-
+rTeh (B)
+Cham (B)
+Take Away
+Tx -2.200 2.20
+SR
+:2 x.
+2.20.
+4:40
+:SR
+1 x
+2,20
+:0.20
+2.20
+SR
+0:80 SR
+Total QTY 81
+Total (Excluding GST):
+; GST {payab]el(6%):
+Total (Indlusive of-GST)E
+TOTALAI
+9,07
+0:53
+9:60
+1'0g
+CASH.
+9,80
+GST: Summary
+(06%)
+Amount (RM)
+9.07
+•
+Tax(RM)
+•
+0153
