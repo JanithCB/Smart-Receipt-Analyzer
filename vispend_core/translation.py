@@ -6,27 +6,29 @@ try:
 except ImportError:
     GoogleTranslator = None
 
+
 def detect_language(text: str) -> str:
-    # Very simple heuristic; you can plug in a real detector later
-    if any("\u0d80" <= ch <= "\u0dff" for ch in text):  # Sinhala
+    if any("\u0d80" <= ch <= "\u0dff" for ch in text):
         return "si"
-    if any("\u0b80" <= ch <= "\u0bff" for ch in text):  # Tamil
+
+    if any("\u0b80" <= ch <= "\u0bff" for ch in text):
         return "ta"
+
     return "auto"
 
-def translate_to_english(text: str) -> Tuple[str, str]:
-    """
-    Returns (translated_text, detected_lang).
-    If translator not installed, returns original text.
-    """
-    if not text.strip():
-        return text, "auto"
 
-    if GoogleTranslator is None:
-        # Fallback: no translation library installed
-        return text, "auto"
+def translate_to_english(text: str) -> Tuple[str, str]:
+    if not text or not text.strip():
+        return "", "auto"
 
     detected = detect_language(text)
-    translator = GoogleTranslator(source=detected, target="en")
-    translated = translator.translate(text)
-    return translated, detected
+
+    if GoogleTranslator is None:
+        return text, detected
+
+    try:
+        translator = GoogleTranslator(source=detected, target="en")
+        translated = translator.translate(text)
+        return translated if translated else text, detected
+    except Exception:
+        return text, detected
